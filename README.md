@@ -2,6 +2,12 @@
 
 Reverse-engineered Go client for [Kagi Assistant](https://kagi.com/assistant). CLI + embedded HTTP server.
 
+> **Disclaimer.** Unofficial, third-party project. Not affiliated with, endorsed by,
+> or supported by Kagi. The protocol is reverse-engineered from observed browser
+> traffic and may break at any time when Kagi updates their service. Use at your
+> own risk; you are responsible for complying with [Kagi's Terms of Service](https://kagi.com/terms).
+> Provided as-is, without warranty of any kind.
+
 ## Quick start
 
 ```bash
