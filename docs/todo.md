@@ -49,11 +49,24 @@ Ordered roughly by usefulness for automation.
 - `/settings?p=custom_assistant` page handles create/edit/delete. Would let us
   manage profiles programmatically. Lower priority — UI is fine for this.
 
-## Session refresh
+## ~~Session refresh~~ ✓ done
 
-- Cookie expires (~30+ days). Could implement a `kagi login --email --password`
-  flow that POSTs to `/signin` and persists the cookie to `~/.config/kagi/session`.
-- Or accept that the user will refresh manually. Current design.
+`kagi login` + transparent auto-relogin on auth fail (404/401/403/302). Session
+persists in OS keyring via `zalando/go-keyring`. See `docs/decisions.md`.
+
+### Limitation: single-account-per-machine
+
+The keyring entry is keyed only by service name (`kagi-cli` / `session`).
+Switching `KAGI_EMAIL` to a second account on the same machine does **not**
+trigger a fresh login — `resolveSession` finds the cached session for the
+previous account first and uses it. Workarounds today:
+
+- `kagi logout` between accounts.
+- Set `KAGI_SESSION` explicitly (overrides keyring).
+
+A proper fix would key the keyring entry by email (or by a stable user id
+returned from /assistant), so different `KAGI_EMAIL` values fetch different
+cached sessions. Defer until someone actually has this problem.
 
 ## Unit tests
 

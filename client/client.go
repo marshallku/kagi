@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
+	"strings"
 )
 
 const (
@@ -20,16 +22,72 @@ const (
 
 type Client struct {
 	Session   string
+	Email     string
+	Password  string
 	UserAgent string
 	HTTP      *http.Client
+	// OnRefresh, if set, is called with the new session value after a
+	// successful auto-login or explicit Login() call.
+	OnRefresh func(session string)
 }
 
 func New(session string) *Client {
+	jar, _ := cookiejar.New(nil)
 	return &Client{
 		Session:   session,
 		UserAgent: DefaultUA,
-		HTTP:      &http.Client{},
+		HTTP: &http.Client{
+			Jar: jar,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
+}
+
+// SetCredentials enables auto-relogin: when a request fails with an auth
+// error, the client will silently re-authenticate once and retry.
+func (c *Client) SetCredentials(email, password string) {
+	c.Email = email
+	c.Password = password
+}
+
+// newRequest builds an HTTP request with the spoofed User-Agent always set,
+// so every outbound call (login, prompt, page fetches) looks like a browser.
+func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+	ua := c.UserAgent
+	if ua == "" {
+		ua = DefaultUA
+	}
+	req, err := http.NewRequestWithContext(ctx, method, BaseURL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	return req, nil
+}
+
+func (c *Client) hasCreds() bool {
+	return c.Email != "" && c.Password != ""
+}
+
+// isAuthFail reports whether a response indicates the session is invalid.
+// Kagi obscures the auth check by serving 404 for unauthenticated requests
+// to /assistant/prompt rather than the conventional 401/403; we also treat
+// 302 redirects to /signin or /signup as auth failure.
+func isAuthFail(resp *http.Response) bool {
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return true
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		loc := resp.Header.Get("Location")
+		if strings.Contains(loc, "/signin") || strings.Contains(loc, "/signup") {
+			return true
+		}
+	}
+	return false
 }
 
 type PromptRequest struct {
@@ -73,27 +131,46 @@ type ChatResult struct {
 }
 
 func (c *Client) Stream(ctx context.Context, req PromptRequest) (<-chan Event, <-chan error, error) {
+	return c.stream(ctx, req, false)
+}
+
+func (c *Client) stream(ctx context.Context, req PromptRequest, retried bool) (<-chan Event, <-chan error, error) {
 	if c.Session == "" {
-		return nil, nil, errors.New("client: empty session")
+		if !retried && c.hasCreds() {
+			if err := c.Login(ctx); err != nil {
+				return nil, nil, fmt.Errorf("auto-login: %w", err)
+			}
+		} else {
+			return nil, nil, errors.New("client: empty session (set KAGI_SESSION or KAGI_EMAIL/KAGI_PASSWORD)")
+		}
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+PromptPath, bytes.NewReader(body))
+	httpReq, err := c.newRequest(ctx, http.MethodPost, PromptPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", StreamAccept)
 	httpReq.Header.Set("Cookie", "kagi_session="+c.Session)
-	httpReq.Header.Set("User-Agent", c.UserAgent)
 	httpReq.Header.Set("Referer", BaseURL+"/assistant")
 	httpReq.Header.Set("Origin", BaseURL)
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
 		return nil, nil, fmt.Errorf("send: %w", err)
+	}
+	if isAuthFail(resp) {
+		resp.Body.Close()
+		if !retried && c.hasCreds() {
+			if err := c.Login(ctx); err != nil {
+				return nil, nil, fmt.Errorf("relogin after auth fail: %w", err)
+			}
+			return c.stream(ctx, req, true)
+		}
+		return nil, nil, fmt.Errorf("auth failed (status %d); refresh KAGI_SESSION or set KAGI_EMAIL/KAGI_PASSWORD", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()

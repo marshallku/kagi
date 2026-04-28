@@ -6,12 +6,16 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/marshallku/kagi-cli/client"
 )
 
 type Server struct {
+	mu               sync.RWMutex
 	session          string
+	email            string
+	password         string
 	defaultProfileID string
 	defaultModel     string
 }
@@ -22,6 +26,38 @@ func New(session string) *Server {
 		defaultProfileID: os.Getenv("KAGI_PROFILE_ID"),
 		defaultModel:     getenvOr("KAGI_MODEL", "ki_quick"),
 	}
+}
+
+// SetCredentials enables auto-relogin on auth failure. The server persists
+// any refreshed session value to the keyring transparently.
+func (s *Server) SetCredentials(email, password string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.email = email
+	s.password = password
+}
+
+// newClient builds a client snapshot for one request. OnRefresh writes any
+// new session back to the server's master state and the OS keyring, so
+// subsequent requests automatically pick up the refreshed cookie.
+func (s *Server) newClient() *client.Client {
+	s.mu.RLock()
+	sess, email, pw := s.session, s.email, s.password
+	s.mu.RUnlock()
+
+	c := client.New(sess)
+	if email != "" && pw != "" {
+		c.SetCredentials(email, pw)
+	}
+	c.OnRefresh = func(ns string) {
+		s.mu.Lock()
+		s.session = ns
+		s.mu.Unlock()
+		if err := client.SaveSession(ns); err != nil {
+			fmt.Fprintln(os.Stderr, "kagi: warn: keyring save failed:", err)
+		}
+	}
+	return c
 }
 
 type chatRequest struct {
@@ -69,7 +105,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	res, err := client.New(s.session).Send(r.Context(), pr, nil)
+	res, err := s.newClient().Send(r.Context(), pr, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -95,7 +131,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, errs, streamErr := client.New(s.session).Stream(r.Context(), pr)
+	events, errs, streamErr := s.newClient().Stream(r.Context(), pr)
 	if streamErr != nil {
 		http.Error(w, streamErr.Error(), http.StatusBadGateway)
 		return

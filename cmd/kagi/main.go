@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"strings"
+
+	"github.com/zalando/go-keyring"
 
 	"github.com/marshallku/kagi-cli/client"
 	"github.com/marshallku/kagi-cli/server"
@@ -17,15 +20,19 @@ import (
 const usage = `kagi - Kagi Assistant CLI/HTTP client
 
 Usage:
-  kagi chat   [-t thread] [--parent msg] [-m model] [-p profile] [--stream|--json] <prompt...>
-  kagi serve  [-addr 127.0.0.1:8921]
+  kagi chat    [-t thread] [--parent msg] [-m model] [-p profile] [--stream|--json] <prompt...>
+  kagi serve   [-addr 127.0.0.1:8921]
+  kagi login   - sign in with KAGI_EMAIL/KAGI_PASSWORD; cache session in OS keyring
+  kagi logout  - delete cached session
 
 Env:
-  KAGI_SESSION     value of the kagi_session cookie (required)
+  KAGI_SESSION     value of the kagi_session cookie (overrides keyring)
+  KAGI_EMAIL       account email (enables auto-login when session is missing/expired)
+  KAGI_PASSWORD    account password
   KAGI_PROFILE_ID  default profile UUID (custom assistant id)
   KAGI_MODEL       default model id (e.g. ki_quick, claude-4-sonnet, grok-4-20)
 
-Tip: get the cookie via DevTools (kagi.com → Application → Cookies → kagi_session).
+Session resolution: KAGI_SESSION → keyring → auto-login (if KAGI_EMAIL+KAGI_PASSWORD set).
 `
 
 func main() {
@@ -38,12 +45,44 @@ func main() {
 		chatCmd(os.Args[2:])
 	case "serve":
 		serveCmd(os.Args[2:])
+	case "login":
+		loginCmd(os.Args[2:])
+	case "logout":
+		logoutCmd(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand: %s\n\n%s", os.Args[1], usage)
 		os.Exit(2)
 	}
+}
+
+// resolveSession returns the cookie value to use, prefering env over keyring.
+// Empty result is OK: the client will auto-login if creds are set.
+func resolveSession() string {
+	if v := os.Getenv("KAGI_SESSION"); v != "" {
+		return v
+	}
+	if v, err := client.LoadSession(); err == nil {
+		return v
+	}
+	return ""
+}
+
+// newAuthedClient builds a Client wired with credentials (if present) and a
+// keyring-persisting OnRefresh hook so any auto-login transparently updates
+// the cached session.
+func newAuthedClient(session string) *client.Client {
+	c := client.New(session)
+	if email, pw := os.Getenv("KAGI_EMAIL"), os.Getenv("KAGI_PASSWORD"); email != "" && pw != "" {
+		c.SetCredentials(email, pw)
+	}
+	c.OnRefresh = func(s string) {
+		if err := client.SaveSession(s); err != nil {
+			fmt.Fprintln(os.Stderr, "kagi: warn: keyring save failed:", err)
+		}
+	}
+	return c
 }
 
 func chatCmd(args []string) {
@@ -57,7 +96,6 @@ func chatCmd(args []string) {
 	noInternet := fs.Bool("no-internet", false, "disable internet access")
 	_ = fs.Parse(args)
 
-	session := mustEnv("KAGI_SESSION")
 	if *profile == "" {
 		die("profile id not set; pass -p or KAGI_PROFILE_ID")
 	}
@@ -88,7 +126,7 @@ func chatCmd(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	c := client.New(session)
+	c := newAuthedClient(resolveSession())
 
 	var lastText string
 	onToken := func(t string) {
@@ -125,12 +163,46 @@ func serveCmd(args []string) {
 	addr := fs.String("addr", "127.0.0.1:8921", "listen address")
 	_ = fs.Parse(args)
 
-	session := mustEnv("KAGI_SESSION")
-	s := server.New(session)
+	s := server.New(resolveSession())
+	if email, pw := os.Getenv("KAGI_EMAIL"), os.Getenv("KAGI_PASSWORD"); email != "" && pw != "" {
+		s.SetCredentials(email, pw)
+	}
 	fmt.Fprintf(os.Stderr, "kagi serve on http://%s\n", *addr)
 	if err := s.ListenAndServe(*addr); err != nil {
 		die(err.Error())
 	}
+}
+
+func loginCmd(args []string) {
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	_ = fs.Parse(args)
+
+	email := mustEnv("KAGI_EMAIL")
+	pw := mustEnv("KAGI_PASSWORD")
+
+	c := client.New("")
+	c.SetCredentials(email, pw)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	if err := c.Login(ctx); err != nil {
+		die(err.Error())
+	}
+	if err := client.SaveSession(c.Session); err != nil {
+		die("keyring save: " + err.Error())
+	}
+	fmt.Fprintln(os.Stderr, "kagi: signed in; session cached in keyring")
+}
+
+func logoutCmd(args []string) {
+	fs := flag.NewFlagSet("logout", flag.ExitOnError)
+	_ = fs.Parse(args)
+	err := client.DeleteSession()
+	if err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		die("keyring delete: " + err.Error())
+	}
+	fmt.Fprintln(os.Stderr, "kagi: cached session deleted")
 }
 
 func mustEnv(k string) string {

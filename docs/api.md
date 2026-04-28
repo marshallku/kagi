@@ -142,6 +142,72 @@ internet access toggle, lens, etc. The `profile.id` is a UUID; find yours via:
 There appears to be a default profile per account; we have not yet
 reverse-engineered the discovery API.
 
+## Sign-in flow (captured 2026-04-28)
+
+Two-step: GET the form to capture CSRF + paired session cookie, then POST.
+
+### GET /signin
+
+Returns the HTML sign-in page. The form contains a hidden `_csrf` token, plus
+the server sets cookies (anti-CSRF + a temp session) that **must** be replayed
+on the POST. Without those cookies, POST /login returns 403 even with a valid
+CSRF value.
+
+```html
+<form action="https://kagi.com/login" method="post" enctype="application/x-www-form-urlencoded">
+  <input type="hidden" name="_csrf" value="fJxHGYaotOG2P3-_OnyR_XlI_djnRUAzy1BwiNvc6CR06ouHelC4LeCTNkbelpD0X7mVNiiSm2ab67Bius63BA==">
+  <input type="hidden" name="r" value="/assistant">
+  <input type="text" name="email" autocomplete="username" required>
+  <input type="password" name="password" autocomplete="current-password">
+  <input type="checkbox">  <!-- "Remember me", unnamed -->
+  <button type="submit">Sign In</button>
+</form>
+```
+
+### POST /login
+
+```http
+POST /login HTTP/1.1
+Host: kagi.com
+Content-Type: application/x-www-form-urlencoded
+Origin: https://kagi.com
+Referer: https://kagi.com/signin
+Cookie: <whatever GET /signin set>
+
+_csrf=fJxHGYaotOG2P3-_...&r=%2Fassistant&email=user%40example.com&password=...
+```
+
+Form-encoded only. Note the form action is **`/login`**, not `/signin`. The
+`r` field is the post-login redirect target (any sane path; `/` works).
+
+Successful response:
+
+```http
+HTTP/1.1 302 Found
+Location: /assistant
+Set-Cookie: kagi_session=ISAqB7Rs...; Domain=.kagi.com; Path=/; HttpOnly; Secure; SameSite=Lax
+```
+
+Failure modes:
+
+- 200 OK with the sign-in form re-rendered (wrong credentials).
+- 302 Found with `Location: /signin?...` (also rejection).
+- 403 Forbidden (missing the GET-sourced cookies, or CSRF token mismatch).
+
+The Go client uses a `cookiejar.Jar` so the GET → POST chain replays the
+cookies automatically; redirects are disabled (`http.ErrUseLastResponse`)
+so we can read the `Set-Cookie` from the 302 directly.
+
+## 404-as-auth-fail quirk
+
+For unauthenticated `POST /assistant/prompt`, Kagi returns **404 Not Found**
+(not 401/403). The Go client treats 404, 401, 403, and 3xx redirects to
+/signin or /signup all as auth failure and triggers auto-relogin once.
+
+This means a real 404 (e.g. malformed thread id) will also trigger one
+relogin attempt, but the retry will see the same 404 and surface it as the
+final error — no infinite loop.
+
 ## Endpoints not yet captured
 
 - Profile list / default profile

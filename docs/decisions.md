@@ -7,18 +7,59 @@
 - stdlib net/http + encoding/json is enough; no external deps.
 - Single static binary works for both CLI and HTTP server modes.
 
-## Why cookie auth (not ID/PW automation)
+## Auth: tiered fallback (env → keyring → auto-login)
 
-- Kagi supports OAuth (Google/Apple/MS/GitHub), QR, and password sign-in. Most
-  of these aren't headless-friendly.
-- Re-implementing the sign-in flow would tie us to its CSRF + form layout,
-  which can change. The cookie is stable as long as the session lives.
-- The user already lives inside a browser; copying the cookie is one click.
-- Keeps username/password out of the config — a cookie is a single ephemeral
-  secret that can be rotated by simply signing out.
+Three layers, tried in order on every command:
 
-Trade-off: cookie expires (looks like 30+ days based on `expires` field), so
-the user has to refresh it occasionally. We accept this for simplicity.
+1. `KAGI_SESSION` env var — explicit override.
+2. OS keyring entry under service `kagi-cli`, key `session`.
+3. Auto-login via `KAGI_EMAIL`/`KAGI_PASSWORD` (if both set), invoked
+   transparently the first time the client sees a missing/expired session.
+
+Any successful login (explicit `kagi login` or auto-login on auth failure)
+writes the new cookie back to the keyring via the client's `OnRefresh`
+callback, so subsequent commands skip re-auth.
+
+### Why keyring (libsecret on Linux, Keychain on macOS)
+
+- Filesystem files require careful 0600 + parent-dir handling and are still
+  readable by every process running as the user.
+- Keyring entries are gated by the active desktop session (gnome-keyring /
+  KWallet on Linux, login keychain on macOS). Sleeping the desktop locks
+  them; switching users locks them.
+- `zalando/go-keyring` is small, has no runtime daemon of its own, and
+  delegates to whatever Secret Service is running.
+
+Trade-off: a server-only host without a desktop session has no Secret
+Service. For that case, fall back to setting `KAGI_SESSION` directly.
+
+### Why support both `kagi login` and silent auto-login
+
+`kagi login` is for one-time manual setup or for environments where you
+want explicit failure on bad credentials. Silent auto-login is for
+unattended automation — no operator needs to be available to refresh the
+cookie when it expires. Both feed the same keyring entry.
+
+## Why we always spoof User-Agent
+
+Set in `client.newRequest`, applied to every outbound call (signin, login,
+prompt). Two reasons:
+
+1. Kagi's CSP and rate-limiter may treat unidentified UAs differently. The
+   browser-flavored UA has been verified to work end-to-end.
+2. Avoids leaking that the client is a custom Go binary, which has no
+   downside for legitimate usage and some upside if Kagi tightens detection.
+
+The UA value is a real-Chrome-on-Linux template (no `HeadlessChrome`,
+`python-requests`, or `Go-http-client/1.1`).
+
+## 404-as-auth-fail handling
+
+Kagi returns 404 (not 401/403) for unauth requests to /assistant/prompt to
+obscure the endpoint. `client.isAuthFail` treats 404 as an auth-fail signal
+and triggers one relogin attempt; if the retry also 404s, that's the final
+error. This means a genuine 404 (bad thread/branch id) costs one extra
+relogin round-trip but is otherwise correct — no infinite loop.
 
 ## Why CLI + HTTP server in one binary
 
