@@ -1,0 +1,7 @@
+/kagi
+/bin/
+*.test
+*.out
+.env
+.env.*
+!.env.example
