@@ -53,12 +53,13 @@ Three persistence layers, picked by data type:
 | ---------------------------------------- | ----------------------------- | -------------------------------------------------- |
 | OS keyring (`kagi`/`session`)            | session cookie                | secret, machine-local, gated by desktop login.     |
 | Config file (`~/.config/kagi/config.json`) | non-secret defaults (`model`) | survives reboots, doesn't pollute the env, easily inspected/edited, supports `kagi config set/get`. |
-| Env vars (`KAGI_EMAIL`, `KAGI_PASSWORD`, `KAGI_PROFILE_ID`, `KAGI_SESSION`) | per-process overrides + secrets sourced from password managers | natural fit for shell-driven workflows; secrets stay out of any file we write. |
+| Env vars (`KAGI_EMAIL`, `KAGI_PASSWORD`, `KAGI_SESSION`) | secrets only, sourced from password managers | natural fit for shell-driven workflows; secrets stay out of any file we write. |
 
-`KAGI_MODEL` was deliberately removed: it's a non-secret default that's
-better managed by `kagi config set model <id>` than by every shell rc.
-Profile id remains an env var because we don't yet have a clean discovery
-flow — one day a `kagi config set profile <id>` will replace it.
+`KAGI_MODEL` and `KAGI_PROFILE_ID` were both removed in favor of `kagi
+config set <key> <value>`. The trigger for moving profile to config was
+adding the `kagi profiles` discovery command (parses the embedded
+`json-profile-list` on `/assistant`) — once you can list profile UUIDs,
+managing them in a config file is strictly better than via env.
 
 ## Why we always spoof User-Agent
 
@@ -131,9 +132,6 @@ INFO findings deliberately not addressed:
 
 ## Things deliberately left out
 
-- Profile / thread list endpoints — not reverse-engineered. The user supplies
-  `KAGI_PROFILE_ID` from devtools. See `docs/todo.md`.
+- Thread list / history endpoints — not reverse-engineered. See `docs/todo.md`.
 - Tests — covered by manual end-to-end testing against real Kagi during dev.
   Unit tests for the stream parser would be cheap to add later.
-- Session refresh / cookie auto-fetch — would require an OAuth/password flow.
-  Out of scope for v1.

@@ -13,10 +13,11 @@ export KAGI_PASSWORD='...'
 # — or —
 export KAGI_SESSION='<value of kagi_session cookie>'   # manual cookie
 
-export KAGI_PROFILE_ID='<your custom assistant uuid>'
-
-# pick a default model (saved to ~/.config/kagi/config.json)
-kagi config set model grok-4-20    # or ki_quick, claude-4-sonnet, ...
+# discover & pick defaults (saved to ~/.config/kagi/config.json)
+kagi models                         # list available models
+kagi profiles                       # list custom assistants
+kagi config set model grok-4-20     # ★ recommended ones marked
+kagi config set profile <uuid>
 
 # new conversation (will auto-login on first run, cache session in keyring)
 kagi chat "What is 2+2?"
@@ -39,9 +40,10 @@ kagi login    # interactive (TTY: prompts, password silent) or piped:
 kagi logout   # delete cached session
 
 # config (non-secret defaults)
-kagi config get          # print all
-kagi config get model    # print one key
+kagi config get              # print all
+kagi config get model        # print one key
 kagi config set model ki_quick
+kagi config set profile <uuid>
 ```
 
 ## Layout

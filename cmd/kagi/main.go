@@ -10,7 +10,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/zalando/go-keyring"
 	"golang.org/x/term"
@@ -26,17 +28,22 @@ Usage:
   kagi serve               [-addr 127.0.0.1:8921]
   kagi login               sign in (env or stdin) and cache session in OS keyring
   kagi logout              delete cached session
+  kagi models              list available models (id, name, provider)
+  kagi profiles            list profiles & custom assistants (id, name, model)
   kagi config get [key]    print one config value, or all when key omitted
-  kagi config set <k> <v>  set a config value (keys: model)
+  kagi config set <k> <v>  set a config value (keys: model, profile)
 
 Env:
-  KAGI_SESSION     value of the kagi_session cookie (overrides keyring)
-  KAGI_EMAIL       account email (enables auto-login when session is missing/expired)
-  KAGI_PASSWORD    account password
-  KAGI_PROFILE_ID  default profile UUID (custom assistant id)
+  KAGI_SESSION   value of the kagi_session cookie (overrides keyring)
+  KAGI_EMAIL     account email (enables auto-login when session is missing/expired)
+  KAGI_PASSWORD  account password
 
-Model default comes from the config file ($XDG_CONFIG_HOME/kagi/config.json).
-Set it with: kagi config set model <id>     (e.g. ki_quick, claude-4-sonnet)
+Defaults (model + profile) come from $XDG_CONFIG_HOME/kagi/config.json.
+Discover and set them with:
+  kagi models                      # see all model ids (e.g. grok-4-20)
+  kagi profiles                    # see all profile uuids
+  kagi config set model <id>
+  kagi config set profile <uuid>
 Session order: KAGI_SESSION → keyring → auto-login (if KAGI_EMAIL+KAGI_PASSWORD).
 `
 
@@ -56,6 +63,10 @@ func main() {
 		logoutCmd(os.Args[2:])
 	case "config":
 		configCmd(os.Args[2:])
+	case "models":
+		modelsCmd(os.Args[2:])
+	case "profiles":
+		profilesCmd(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -102,14 +113,14 @@ func chatCmd(args []string) {
 	threadID := fs.String("t", "", "existing thread id (omit to create new)")
 	parentID := fs.String("parent", "", "parent message id (required with -t)")
 	model := fs.String("m", cfg.Model, "model id (default from config)")
-	profile := fs.String("p", os.Getenv("KAGI_PROFILE_ID"), "profile id (custom assistant uuid)")
+	profile := fs.String("p", cfg.Profile, "profile id (default from config)")
 	asJSON := fs.Bool("json", false, "emit final JSON result instead of text")
 	stream := fs.Bool("stream", false, "stream raw tokens (HTML) as they arrive")
 	noInternet := fs.Bool("no-internet", false, "disable internet access")
 	_ = fs.Parse(args)
 
 	if *profile == "" {
-		die("profile id not set; pass -p or KAGI_PROFILE_ID")
+		die("profile not set; pass -p or run: kagi config set profile <uuid> (see: kagi profiles)")
 	}
 	if *model == "" {
 		die("model not set; pass -m or run: kagi config set model <id>")
@@ -304,8 +315,10 @@ func configGet(args []string) {
 	switch args[0] {
 	case "model":
 		fmt.Println(cfg.Model)
+	case "profile":
+		fmt.Println(cfg.Profile)
 	default:
-		die("unknown config key: " + args[0])
+		die("unknown config key: " + args[0] + " (expected model|profile)")
 	}
 }
 
@@ -320,13 +333,116 @@ func configSet(args []string) {
 	switch args[0] {
 	case "model":
 		cfg.Model = args[1]
+	case "profile":
+		cfg.Profile = args[1]
 	default:
-		die("unknown config key: " + args[0])
+		die("unknown config key: " + args[0] + " (expected model|profile)")
 	}
 	if err := client.SaveConfig(cfg); err != nil {
 		die("config save: " + err.Error())
 	}
 	fmt.Fprintf(os.Stderr, "kagi: %s = %s (saved to %s)\n", args[0], args[1], client.ConfigPath())
+}
+
+func modelsCmd(args []string) {
+	fs := flag.NewFlagSet("models", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "emit JSON instead of a table")
+	_ = fs.Parse(args)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	profiles, err := newAuthedClient(resolveSession()).FetchProfiles(ctx)
+	if err != nil {
+		die(err.Error())
+	}
+
+	type modelEntry struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Provider    string `json:"provider"`
+		Recommended bool   `json:"recommended"`
+	}
+	seen := map[string]modelEntry{}
+	for _, p := range profiles {
+		if !p.Accessible || p.Deprecate || p.Retired || p.Model == "" {
+			continue
+		}
+		if _, ok := seen[p.Model]; ok {
+			continue
+		}
+		seen[p.Model] = modelEntry{
+			ID: p.Model, Name: p.ModelName, Provider: p.ModelProvider, Recommended: p.Recommended,
+		}
+	}
+
+	out := make([]modelEntry, 0, len(seen))
+	for _, m := range seen {
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Provider != out[j].Provider {
+			return out[i].Provider < out[j].Provider
+		}
+		return out[i].ID < out[j].ID
+	})
+
+	if *asJSON {
+		_ = json.NewEncoder(os.Stdout).Encode(out)
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "  MODEL\tNAME\tPROVIDER")
+	for _, m := range out {
+		marker := " "
+		if m.Recommended {
+			marker = "★"
+		}
+		fmt.Fprintf(w, "%s %s\t%s\t%s\n", marker, m.ID, m.Name, m.Provider)
+	}
+	_ = w.Flush()
+	fmt.Fprintln(os.Stderr, "\n★ = recommended.  use: kagi config set model <id>")
+}
+
+func profilesCmd(args []string) {
+	fs := flag.NewFlagSet("profiles", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "emit JSON instead of a table")
+	_ = fs.Parse(args)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	profiles, err := newAuthedClient(resolveSession()).FetchProfiles(ctx)
+	if err != nil {
+		die(err.Error())
+	}
+
+	visible := profiles[:0]
+	for _, p := range profiles {
+		if p.ID == "" || !p.Accessible || p.Deprecate || p.Retired {
+			continue
+		}
+		visible = append(visible, p)
+	}
+	sort.Slice(visible, func(i, j int) bool {
+		return visible[i].Name < visible[j].Name
+	})
+
+	if *asJSON {
+		_ = json.NewEncoder(os.Stdout).Encode(visible)
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "  PROFILE_ID\tNAME\tMODEL")
+	for _, p := range visible {
+		marker := " "
+		if p.IsDefaultProfile {
+			marker = "★"
+		}
+		fmt.Fprintf(w, "%s %s\t%s\t%s\n", marker, p.ID, p.Name, p.Model)
+	}
+	_ = w.Flush()
+	fmt.Fprintln(os.Stderr, "\n★ = system default.  use: kagi config set profile <uuid>")
 }
 
 func die(msg string) {

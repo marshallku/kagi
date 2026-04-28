@@ -134,13 +134,44 @@ system-prompt/tooling but route to a different underlying model.
 ## Profiles
 
 A "profile" in Kagi is a Custom Assistant — system prompt, default model,
-internet access toggle, lens, etc. The `profile.id` is a UUID; find yours via:
+internet access toggle, lens, etc. The `profile.id` is a UUID.
 
-1. `/assistant` → click the model picker → inspect the option element.
-2. Or read `<a href="/settings?p=custom_assistant&id=<UUID>">` from the HTML.
+### Discovery: `<div id="json-profile-list" hidden>`
 
-There appears to be a default profile per account; we have not yet
-reverse-engineered the discovery API.
+The `/assistant` page embeds the **entire profile catalog** as escaped JSON
+inside a hidden div:
+
+```html
+<div id="json-profile-list" hidden>{&quot;profiles&quot;:[{&quot;id&quot;:&quot;...&quot;,...}]}</div>
+```
+
+Decode with `html.UnescapeString` then `json.Unmarshal`. Each entry:
+
+```json
+{
+  "id": "e47dcf40-61fc-4da5-99a0-2d403ac41c00",
+  "name": "수진",
+  "model": "claude-4-sonnet",
+  "model_name": "Claude 4.6 Sonnet",
+  "model_provider": "anthropic",
+  "model_provider_name": "Anthropic",
+  "accessible": true,
+  "deprecate": false,
+  "retired": false,
+  "recommended": false,
+  "is_default_profile": false,
+  "internet_access": false,
+  "personalizations": true,
+  "model_input_limit": 1000000
+}
+```
+
+The list contains BOTH base profiles (one per available model, mostly with
+empty `id` — system entries not user-selectable) AND user-created Custom
+Assistants. Filter by `id != ""` for what's usable as `profile_id`.
+
+`kagi models` and `kagi profiles` are the CLI surface over this; both
+deduplicate and skip `deprecate`/`retired`/`!accessible` entries.
 
 ## Sign-in flow (captured 2026-04-28)
 

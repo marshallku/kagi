@@ -2,17 +2,17 @@
 
 Ordered roughly by usefulness for automation.
 
-## Profile / model discovery
+## ~~Profile / model discovery~~ ✓ done
 
-- `GET /assistant` (the page itself) renders the profile dropdown server-side.
-  Could parse the HTML for `data-model` and `data-profile-id` attributes plus
-  the `/settings?p=custom_assistant&id=<UUID>` links to enumerate profiles.
-- Alternatively, hunt for a JSON endpoint that returns profile list (likely
-  exists for the settings page).
-- Once we have it: add `kagi profiles` subcommand for interactive selection,
-  and `kagi config set profile <id>` to persist (replacing the
-  `KAGI_PROFILE_ID` env var the same way `kagi config set model` replaced
-  `KAGI_MODEL`).
+`kagi models` and `kagi profiles` parse `<div id="json-profile-list">` from
+the `/assistant` page. `kagi config set model|profile` persists defaults.
+See `docs/api.md` for the JSON schema.
+
+Open: a small subset of base profiles in the list have empty `id` and
+aren't selectable via the API (`ChatGPT`, `Claude 4.5 Haiku`, etc. — Kagi
+likely materializes a synthetic profile when the user picks them in the UI).
+We just hide them from `kagi profiles`. If we ever want them, capture what
+the UI sends when one is picked.
 
 ## Thread list / history
 

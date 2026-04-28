@@ -24,7 +24,7 @@ func New(session string) *Server {
 	cfg, _ := client.LoadConfig()
 	return &Server{
 		session:          session,
-		defaultProfileID: os.Getenv("KAGI_PROFILE_ID"),
+		defaultProfileID: cfg.Profile,
 		defaultModel:     cfg.Model,
 	}
 }
@@ -82,7 +82,7 @@ func (s *Server) buildPrompt(req chatRequest) (client.PromptRequest, error) {
 		profileID = s.defaultProfileID
 	}
 	if profileID == "" {
-		return client.PromptRequest{}, fmt.Errorf("profile_id required (or set KAGI_PROFILE_ID)")
+		return client.PromptRequest{}, fmt.Errorf("profile_id required (per-request or run: kagi config set profile <uuid>)")
 	}
 	model := req.Model
 	if model == "" {
