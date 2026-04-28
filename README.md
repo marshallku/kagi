@@ -22,7 +22,10 @@ kagi config set profile <uuid>
 # new conversation (will auto-login on first run, cache session in keyring)
 kagi chat "What is 2+2?"
 
-# follow-up (need both ids from a previous response)
+# follow-up (auto: continues most recent thread)
+kagi chat --resume "And 3+3?"
+
+# follow-up (manual: any thread, any parent message)
 kagi chat -t <thread-id> --parent <message-id> "And 3+3?"
 
 # JSON for automation

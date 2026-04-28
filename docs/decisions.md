@@ -45,15 +45,16 @@ prompt + silent password read (`golang.org/x/term`); a pipe just reads two
 lines (email then password). This matches the way password managers
 typically feed credentials to CLIs (`pass kagi/email; pass kagi/pw`).
 
-## Config file vs env vs keyring
+## Config file vs state file vs env vs keyring
 
-Three persistence layers, picked by data type:
+Four persistence layers, split by lifetime + secrecy:
 
-| Where                                    | What                          | Why                                                |
-| ---------------------------------------- | ----------------------------- | -------------------------------------------------- |
-| OS keyring (`kagi`/`session`)            | session cookie                | secret, machine-local, gated by desktop login.     |
-| Config file (`~/.config/kagi/config.json`) | non-secret defaults (`model`) | survives reboots, doesn't pollute the env, easily inspected/edited, supports `kagi config set/get`. |
-| Env vars (`KAGI_EMAIL`, `KAGI_PASSWORD`, `KAGI_SESSION`) | secrets only, sourced from password managers | natural fit for shell-driven workflows; secrets stay out of any file we write. |
+| Where                                          | What                                  | Why                                                                         |
+| ---------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------- |
+| OS keyring (`kagi`/`session`)                  | session cookie                        | secret, machine-local, gated by desktop login.                              |
+| Config (`~/.config/kagi/config.json`)          | durable defaults (`model`, `profile`) | survives reboots, doesn't pollute env, edit via `kagi config set/get`.       |
+| State (`~/.local/state/kagi/last-session.json`) | last-used thread (`--resume` target) | regenerable / ephemeral; XDG state dir, kept apart from config so wiping state doesn't lose preferences. |
+| Env vars (`KAGI_EMAIL`, `KAGI_PASSWORD`, `KAGI_SESSION`) | secrets only, sourced from password managers | shell-driven workflows; secrets stay out of any file we write.        |
 
 `KAGI_MODEL` and `KAGI_PROFILE_ID` were both removed in favor of `kagi
 config set <key> <value>`. The trigger for moving profile to config was

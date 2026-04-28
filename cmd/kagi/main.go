@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/zalando/go-keyring"
 	"golang.org/x/term"
@@ -24,7 +25,7 @@ import (
 const usage = `kagi - Kagi Assistant CLI/HTTP client
 
 Usage:
-  kagi chat                [-t thread] [--parent msg] [-m model] [-p profile] [--stream|--json] <prompt...>
+  kagi chat                [-t thread] [--parent msg] [--resume] [-m model] [-p profile] [--stream|--json] <prompt...>
   kagi serve               [-addr 127.0.0.1:8921]
   kagi login               sign in (env or stdin) and cache session in OS keyring
   kagi logout              delete cached session
@@ -112,12 +113,29 @@ func chatCmd(args []string) {
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
 	threadID := fs.String("t", "", "existing thread id (omit to create new)")
 	parentID := fs.String("parent", "", "parent message id (required with -t)")
+	resume := fs.Bool("resume", false, "continue the most recent thread (auto-fills -t/--parent)")
 	model := fs.String("m", cfg.Model, "model id (default from config)")
 	profile := fs.String("p", cfg.Profile, "profile id (default from config)")
 	asJSON := fs.Bool("json", false, "emit final JSON result instead of text")
 	stream := fs.Bool("stream", false, "stream raw tokens (HTML) as they arrive")
 	noInternet := fs.Bool("no-internet", false, "disable internet access")
 	_ = fs.Parse(args)
+
+	if *resume {
+		if *threadID != "" || *parentID != "" {
+			die("--resume cannot be combined with -t or --parent")
+		}
+		last, err := client.LoadLastSession()
+		if err != nil {
+			die("read last session: " + err.Error())
+		}
+		if last.ThreadID == "" {
+			die("no saved session at " + client.StatePath() + " (run a chat first)")
+		}
+		*threadID = last.ThreadID
+		*parentID = last.MessageID
+		fmt.Fprintf(os.Stderr, "[resuming thread=%s title=%q]\n", last.ThreadID, last.Title)
+	}
 
 	if *profile == "" {
 		die("profile not set; pass -p or run: kagi config set profile <uuid> (see: kagi profiles)")
@@ -167,6 +185,19 @@ func chatCmd(args []string) {
 	res, err := c.Send(ctx, req, onToken)
 	if err != nil {
 		die(err.Error())
+	}
+
+	if res.ThreadID != "" && res.MessageID != "" {
+		if err := client.SaveLastSession(client.LastSession{
+			ThreadID:  res.ThreadID,
+			MessageID: res.MessageID,
+			Title:     res.Title,
+			Model:     *model,
+			Profile:   *profile,
+			UpdatedAt: time.Now().UTC(),
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "kagi: warn: state save failed:", err)
+		}
 	}
 
 	switch {
