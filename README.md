@@ -1,11 +1,11 @@
-# kagi-cli
+# kagi
 
 Reverse-engineered Go client for [Kagi Assistant](https://kagi.com/assistant). CLI + embedded HTTP server.
 
 ## Quick start
 
 ```bash
-go build -o ~/bin/kagi ./cmd/kagi
+./install.sh   # builds and installs to ~/.local/bin (override BINDIR=...)
 
 # pick one auth method:
 export KAGI_EMAIL='you@example.com'           # auto-login (recommended)
@@ -39,7 +39,7 @@ kagi logout   # delete cached session
 ## Layout
 
 ```
-kagi-cli/
+kagi/
 ├── client/        importable Go library (Stream, Send, NewPrompt)
 ├── server/        HTTP wrapper (POST /chat, POST /chat/stream, GET /healthz)
 ├── cmd/kagi/      CLI entry (subcommands: chat, serve)
@@ -51,7 +51,7 @@ kagi-cli/
 Resolution order on every command:
 
 1. `KAGI_SESSION` env var (explicit override)
-2. OS keyring (`kagi-cli` / `session`, populated by `kagi login` or
+2. OS keyring (`kagi` / `session`, populated by `kagi login` or
    prior auto-login)
 3. Silent auto-login via `KAGI_EMAIL` + `KAGI_PASSWORD`
 

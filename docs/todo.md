@@ -56,7 +56,7 @@ persists in OS keyring via `zalando/go-keyring`. See `docs/decisions.md`.
 
 ### Limitation: single-account-per-machine
 
-The keyring entry is keyed only by service name (`kagi-cli` / `session`).
+The keyring entry is keyed only by service name (`kagi` / `session`).
 Switching `KAGI_EMAIL` to a second account on the same machine does **not**
 trigger a fresh login — `resolveSession` finds the cached session for the
 previous account first and uses it. Workarounds today:

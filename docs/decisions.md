@@ -12,7 +12,7 @@
 Three layers, tried in order on every command:
 
 1. `KAGI_SESSION` env var — explicit override.
-2. OS keyring entry under service `kagi-cli`, key `session`.
+2. OS keyring entry under service `kagi`, key `session`.
 3. Auto-login via `KAGI_EMAIL`/`KAGI_PASSWORD` (if both set), invoked
    transparently the first time the client sees a missing/expired session.
 

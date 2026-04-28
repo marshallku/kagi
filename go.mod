@@ -1,4 +1,4 @@
-module github.com/marshallku/kagi-cli
+module github.com/marshallku/kagi
 
 go 1.22
 

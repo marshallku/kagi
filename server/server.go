@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/marshallku/kagi-cli/client"
+	"github.com/marshallku/kagi/client"
 )
 
 type Server struct {

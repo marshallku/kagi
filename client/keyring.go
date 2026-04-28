@@ -3,7 +3,7 @@ package client
 import "github.com/zalando/go-keyring"
 
 const (
-	KeyringService = "kagi-cli"
+	KeyringService = "kagi"
 	KeyringKey     = "session"
 )
 

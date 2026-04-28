@@ -13,8 +13,8 @@ import (
 
 	"github.com/zalando/go-keyring"
 
-	"github.com/marshallku/kagi-cli/client"
-	"github.com/marshallku/kagi-cli/server"
+	"github.com/marshallku/kagi/client"
+	"github.com/marshallku/kagi/server"
 )
 
 const usage = `kagi - Kagi Assistant CLI/HTTP client
