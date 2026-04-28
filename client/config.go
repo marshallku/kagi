@@ -11,7 +11,8 @@ import (
 // Config holds non-secret CLI defaults (model, etc.). Persisted as JSON at
 // $XDG_CONFIG_HOME/kagi/config.json (or $HOME/.config/kagi/config.json).
 type Config struct {
-	Model string `json:"model,omitempty"`
+	Model   string `json:"model,omitempty"`
+	Profile string `json:"profile,omitempty"`
 }
 
 func ConfigPath() string {
