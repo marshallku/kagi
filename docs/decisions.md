@@ -40,6 +40,26 @@ want explicit failure on bad credentials. Silent auto-login is for
 unattended automation — no operator needs to be available to refresh the
 cookie when it expires. Both feed the same keyring entry.
 
+`kagi login` falls back to stdin when env vars are missing: a TTY gets a
+prompt + silent password read (`golang.org/x/term`); a pipe just reads two
+lines (email then password). This matches the way password managers
+typically feed credentials to CLIs (`pass kagi/email; pass kagi/pw`).
+
+## Config file vs env vs keyring
+
+Three persistence layers, picked by data type:
+
+| Where                                    | What                          | Why                                                |
+| ---------------------------------------- | ----------------------------- | -------------------------------------------------- |
+| OS keyring (`kagi`/`session`)            | session cookie                | secret, machine-local, gated by desktop login.     |
+| Config file (`~/.config/kagi/config.json`) | non-secret defaults (`model`) | survives reboots, doesn't pollute the env, easily inspected/edited, supports `kagi config set/get`. |
+| Env vars (`KAGI_EMAIL`, `KAGI_PASSWORD`, `KAGI_PROFILE_ID`, `KAGI_SESSION`) | per-process overrides + secrets sourced from password managers | natural fit for shell-driven workflows; secrets stay out of any file we write. |
+
+`KAGI_MODEL` was deliberately removed: it's a non-secret default that's
+better managed by `kagi config set model <id>` than by every shell rc.
+Profile id remains an env var because we don't yet have a clean discovery
+flow — one day a `kagi config set profile <id>` will replace it.
+
 ## Why we always spoof User-Agent
 
 Set in `client.newRequest`, applied to every outbound call (signin, login,

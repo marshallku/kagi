@@ -14,7 +14,9 @@ export KAGI_PASSWORD='...'
 export KAGI_SESSION='<value of kagi_session cookie>'   # manual cookie
 
 export KAGI_PROFILE_ID='<your custom assistant uuid>'
-export KAGI_MODEL='ki_quick'   # or grok-4-20, claude-4-sonnet, ...
+
+# pick a default model (saved to ~/.config/kagi/config.json)
+kagi config set model grok-4-20    # or ki_quick, claude-4-sonnet, ...
 
 # new conversation (will auto-login on first run, cache session in keyring)
 kagi chat "What is 2+2?"
@@ -32,8 +34,14 @@ curl -s -X POST localhost:8921/chat \
   -d '{"prompt":"hello"}' | jq .
 
 # explicit session management
-kagi login    # one-shot login + cache
+kagi login    # interactive (TTY: prompts, password silent) or piped:
+#   printf '%s\n%s\n' "$email" "$pw" | kagi login
 kagi logout   # delete cached session
+
+# config (non-secret defaults)
+kagi config get          # print all
+kagi config get model    # print one key
+kagi config set model ki_quick
 ```
 
 ## Layout

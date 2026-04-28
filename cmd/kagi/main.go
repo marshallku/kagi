@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/zalando/go-keyring"
+	"golang.org/x/term"
 
 	"github.com/marshallku/kagi/client"
 	"github.com/marshallku/kagi/server"
@@ -20,19 +22,22 @@ import (
 const usage = `kagi - Kagi Assistant CLI/HTTP client
 
 Usage:
-  kagi chat    [-t thread] [--parent msg] [-m model] [-p profile] [--stream|--json] <prompt...>
-  kagi serve   [-addr 127.0.0.1:8921]
-  kagi login   - sign in with KAGI_EMAIL/KAGI_PASSWORD; cache session in OS keyring
-  kagi logout  - delete cached session
+  kagi chat                [-t thread] [--parent msg] [-m model] [-p profile] [--stream|--json] <prompt...>
+  kagi serve               [-addr 127.0.0.1:8921]
+  kagi login               sign in (env or stdin) and cache session in OS keyring
+  kagi logout              delete cached session
+  kagi config get [key]    print one config value, or all when key omitted
+  kagi config set <k> <v>  set a config value (keys: model)
 
 Env:
   KAGI_SESSION     value of the kagi_session cookie (overrides keyring)
   KAGI_EMAIL       account email (enables auto-login when session is missing/expired)
   KAGI_PASSWORD    account password
   KAGI_PROFILE_ID  default profile UUID (custom assistant id)
-  KAGI_MODEL       default model id (e.g. ki_quick, claude-4-sonnet, grok-4-20)
 
-Session resolution: KAGI_SESSION → keyring → auto-login (if KAGI_EMAIL+KAGI_PASSWORD set).
+Model default comes from the config file ($XDG_CONFIG_HOME/kagi/config.json).
+Set it with: kagi config set model <id>     (e.g. ki_quick, claude-4-sonnet)
+Session order: KAGI_SESSION → keyring → auto-login (if KAGI_EMAIL+KAGI_PASSWORD).
 `
 
 func main() {
@@ -49,6 +54,8 @@ func main() {
 		loginCmd(os.Args[2:])
 	case "logout":
 		logoutCmd(os.Args[2:])
+	case "config":
+		configCmd(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -86,10 +93,15 @@ func newAuthedClient(session string) *client.Client {
 }
 
 func chatCmd(args []string) {
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		die("config load: " + err.Error())
+	}
+
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
 	threadID := fs.String("t", "", "existing thread id (omit to create new)")
 	parentID := fs.String("parent", "", "parent message id (required with -t)")
-	model := fs.String("m", os.Getenv("KAGI_MODEL"), "model id")
+	model := fs.String("m", cfg.Model, "model id (default from config)")
 	profile := fs.String("p", os.Getenv("KAGI_PROFILE_ID"), "profile id (custom assistant uuid)")
 	asJSON := fs.Bool("json", false, "emit final JSON result instead of text")
 	stream := fs.Bool("stream", false, "stream raw tokens (HTML) as they arrive")
@@ -100,7 +112,7 @@ func chatCmd(args []string) {
 		die("profile id not set; pass -p or KAGI_PROFILE_ID")
 	}
 	if *model == "" {
-		die("model not set; pass -m or KAGI_MODEL")
+		die("model not set; pass -m or run: kagi config set model <id>")
 	}
 	if *threadID != "" && *parentID == "" {
 		die("--parent <message-id> is required when -t is set")
@@ -177,8 +189,15 @@ func loginCmd(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	_ = fs.Parse(args)
 
-	email := mustEnv("KAGI_EMAIL")
-	pw := mustEnv("KAGI_PASSWORD")
+	email := os.Getenv("KAGI_EMAIL")
+	pw := os.Getenv("KAGI_PASSWORD")
+	if email == "" || pw == "" {
+		var err error
+		email, pw, err = readMissingCreds(email, pw)
+		if err != nil {
+			die("read credentials: " + err.Error())
+		}
+	}
 
 	c := client.New("")
 	c.SetCredentials(email, pw)
@@ -195,6 +214,59 @@ func loginCmd(args []string) {
 	fmt.Fprintln(os.Stderr, "kagi: signed in; session cached in keyring")
 }
 
+// readMissingCreds fills in email/password from stdin. On a TTY it prompts to
+// stderr and reads the password silently; when piped it expects two lines
+// (email then password) on stdin in order — only for the values that are
+// missing from the environment.
+func readMissingCreds(email, pw string) (string, string, error) {
+	fd := int(os.Stdin.Fd())
+	isTTY := term.IsTerminal(fd)
+	rd := bufio.NewReader(os.Stdin)
+
+	readLine := func(prompt string) (string, error) {
+		if isTTY {
+			fmt.Fprint(os.Stderr, prompt)
+		}
+		line, err := rd.ReadString('\n')
+		if err != nil && line == "" {
+			return "", err
+		}
+		return strings.TrimRight(line, "\r\n"), nil
+	}
+
+	if email == "" {
+		v, err := readLine("Email: ")
+		if err != nil {
+			return "", "", err
+		}
+		email = v
+	}
+	if pw == "" {
+		if isTTY {
+			fmt.Fprint(os.Stderr, "Password: ")
+			b, err := term.ReadPassword(fd)
+			fmt.Fprintln(os.Stderr)
+			if err != nil {
+				return "", "", err
+			}
+			pw = string(b)
+		} else {
+			v, err := readLine("")
+			if err != nil {
+				return "", "", err
+			}
+			pw = v
+		}
+	}
+	if email == "" {
+		return "", "", errors.New("email is empty")
+	}
+	if pw == "" {
+		return "", "", errors.New("password is empty")
+	}
+	return email, pw, nil
+}
+
 func logoutCmd(args []string) {
 	fs := flag.NewFlagSet("logout", flag.ExitOnError)
 	_ = fs.Parse(args)
@@ -205,12 +277,56 @@ func logoutCmd(args []string) {
 	fmt.Fprintln(os.Stderr, "kagi: cached session deleted")
 }
 
-func mustEnv(k string) string {
-	v := os.Getenv(k)
-	if v == "" {
-		die(k + " not set")
+func configCmd(args []string) {
+	if len(args) < 1 {
+		die("usage: kagi config <get|set> [key] [value]")
 	}
-	return v
+	switch args[0] {
+	case "get":
+		configGet(args[1:])
+	case "set":
+		configSet(args[1:])
+	default:
+		die("unknown config action: " + args[0] + " (expected get|set)")
+	}
+}
+
+func configGet(args []string) {
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		die("config load: " + err.Error())
+	}
+	if len(args) == 0 {
+		b, _ := json.MarshalIndent(cfg, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+	switch args[0] {
+	case "model":
+		fmt.Println(cfg.Model)
+	default:
+		die("unknown config key: " + args[0])
+	}
+}
+
+func configSet(args []string) {
+	if len(args) != 2 {
+		die("usage: kagi config set <key> <value>")
+	}
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		die("config load: " + err.Error())
+	}
+	switch args[0] {
+	case "model":
+		cfg.Model = args[1]
+	default:
+		die("unknown config key: " + args[0])
+	}
+	if err := client.SaveConfig(cfg); err != nil {
+		die("config save: " + err.Error())
+	}
+	fmt.Fprintf(os.Stderr, "kagi: %s = %s (saved to %s)\n", args[0], args[1], client.ConfigPath())
 }
 
 func die(msg string) {

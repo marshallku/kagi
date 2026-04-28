@@ -21,10 +21,11 @@ type Server struct {
 }
 
 func New(session string) *Server {
+	cfg, _ := client.LoadConfig()
 	return &Server{
 		session:          session,
 		defaultProfileID: os.Getenv("KAGI_PROFILE_ID"),
-		defaultModel:     getenvOr("KAGI_MODEL", "ki_quick"),
+		defaultModel:     cfg.Model,
 	}
 }
 
@@ -86,6 +87,9 @@ func (s *Server) buildPrompt(req chatRequest) (client.PromptRequest, error) {
 	model := req.Model
 	if model == "" {
 		model = s.defaultModel
+	}
+	if model == "" {
+		return client.PromptRequest{}, fmt.Errorf("model required (per-request or run: kagi config set model <id>)")
 	}
 	internet := true
 	if req.InternetAccess != nil {
@@ -174,11 +178,4 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) ListenAndServe(addr string) error {
 	return http.ListenAndServe(addr, s.Routes())
-}
-
-func getenvOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
 }

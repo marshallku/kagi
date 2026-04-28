@@ -9,8 +9,10 @@ Ordered roughly by usefulness for automation.
   the `/settings?p=custom_assistant&id=<UUID>` links to enumerate profiles.
 - Alternatively, hunt for a JSON endpoint that returns profile list (likely
   exists for the settings page).
-- Once we have it, add `kagi profiles` subcommand and a `default-profile`
-  fallback so users don't need to set `KAGI_PROFILE_ID`.
+- Once we have it: add `kagi profiles` subcommand for interactive selection,
+  and `kagi config set profile <id>` to persist (replacing the
+  `KAGI_PROFILE_ID` env var the same way `kagi config set model` replaced
+  `KAGI_MODEL`).
 
 ## Thread list / history
 
