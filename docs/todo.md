@@ -121,6 +121,26 @@ runs through `client.streamJSON` (used by thread_list / thread_modify /
 thread_delete) — adding a fixture for the `thread_list.html` payload would
 guard against the HTML-shape changes too.
 
+## HTTP API parity — `login` / `logout` / `config` stay CLI-only
+
+Deliberate scope decision: the embedded HTTP server exposes the per-Kagi-call
+operations (chat, threads, assistants, discovery, resume) but NOT the
+per-host admin operations (`kagi login`, `kagi logout`, `kagi config
+get/set`). Reasons:
+
+- `login` would accept raw credentials over HTTP; even on loopback they
+  end up in shell history / process logs. The CLI uses TTY-silent reads
+  precisely to avoid this.
+- `logout` is a destructive op on the host's keyring — easy to fire by
+  accident from a remote caller.
+- `config get/set` modifies `~/.config/kagi/config.json` on the server's
+  host, which doesn't compose with multi-tenant access patterns.
+
+The server already pulls credentials from the keyring/env at boot, so a
+legitimate API caller never needs to hit a login endpoint. Run `kagi
+login` once on the host (or set `KAGI_EMAIL`/`KAGI_PASSWORD` in the
+environment) before `kagi serve`.
+
 ## Integration with `~/dev/life-assistant`
 
 - The Discord bot currently shells out to `claude -p` for AI inference. Could

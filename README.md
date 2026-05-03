@@ -42,6 +42,18 @@ kagi serve -addr 127.0.0.1:8921 &
 curl -s -X POST localhost:8921/chat \
   -H 'content-type: application/json' \
   -d '{"prompt":"hello"}' | jq .
+# threads:    GET    /threads?limit=N&all=true
+#             GET    /threads/{id}
+#             PATCH  /threads/{id}        # body: {title?, saved?, shared?, tag_ids?}
+#             DELETE /threads/{id}
+#             POST   /threads/delete      # body: {ids:[...]}
+#             POST   /threads/search      # body: {q, tag_id?, saved?, shared?}
+# assistants: GET    /assistants          # alias of /profiles
+#             GET    /assistants/{id}
+#             POST   /assistants          # body: {name, base_model, instructions?, ...}
+#             PATCH  /assistants/{id}     # partial update; preserves untouched fields
+#             DELETE /assistants/{id}
+# discovery:  GET    /models, GET /profiles
 
 # explicit session management
 kagi login    # interactive (TTY: prompts, password silent) or piped:
@@ -60,8 +72,8 @@ kagi config set profile <uuid>
 ```
 kagi/
 ├── client/        importable Go library (Stream, Send, NewPrompt)
-├── server/        HTTP wrapper (POST /chat, POST /chat/stream, GET /healthz)
-├── cmd/kagi/      CLI entry (subcommands: chat, serve)
+├── server/        HTTP wrapper — chat + threads + assistants + discovery
+├── cmd/kagi/      CLI entry (subcommands: chat, serve, threads, assistants, …)
 └── docs/          API analysis, decisions, todos, sample captures
 ```
 

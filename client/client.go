@@ -72,6 +72,13 @@ func (c *Client) hasCreds() bool {
 	return c.Email != "" && c.Password != ""
 }
 
+// ErrNotFound is returned by lookup helpers (ShowThread, FetchCustomAssistant)
+// when the upstream resource genuinely doesn't exist — distinct from a
+// transient 404 that the auto-relogin path treats as auth failure. Callers
+// can do `errors.Is(err, client.ErrNotFound)` to surface a 404 instead of
+// reporting an auth or upstream failure.
+var ErrNotFound = errors.New("not found")
+
 // isAuthFail reports whether a response indicates the session is invalid.
 // Kagi obscures the auth check by serving 404 for unauthenticated requests
 // to /assistant/prompt rather than the conventional 401/403; we also treat

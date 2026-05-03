@@ -250,9 +250,12 @@ func (c *Client) ModifyThreads(ctx context.Context, mods ...ThreadModification) 
 }
 
 // DeleteThreads bulk-deletes by UUID. The endpoint takes the same shape as
-// thread_modify ({threads:[{id,title,saved,shared,tag_ids}]}); we fetch each
-// thread first to get a valid envelope. If the metadata fetch fails we fall
-// back to sending just the id, which works for some thread states.
+// thread_modify ({threads:[{id,title,saved,shared,tag_ids}]}), so we fetch
+// each thread first to build a valid envelope (the server returns 500 for a
+// bare {id}). Any lookup failure is propagated — including ErrNotFound for
+// bogus ids — so callers can distinguish "doesn't exist" from "delete
+// failed". For bulk requests this means fail-fast: one bad id rejects the
+// whole batch. Pre-check ids if you want partial success.
 func (c *Client) DeleteThreads(ctx context.Context, ids ...string) error {
 	if len(ids) == 0 {
 		return errors.New("DeleteThreads: at least one id required")
@@ -261,10 +264,7 @@ func (c *Client) DeleteThreads(ctx context.Context, ids ...string) error {
 	for _, id := range ids {
 		d, err := c.ShowThread(ctx, id)
 		if err != nil {
-			// Thread may already be gone, or we can't read it. Send a minimal
-			// envelope and let the server decide.
-			envelopes = append(envelopes, ThreadModification{ID: id, TagIDs: []string{}})
-			continue
+			return fmt.Errorf("delete %s: %w", id, err)
 		}
 		tags := d.TagIDs
 		if tags == nil {
@@ -383,10 +383,10 @@ type ThreadMessage struct {
 	ID         string   `json:"id"`
 	ThreadID   string   `json:"thread_id"`
 	CreatedAt  string   `json:"created_at"`
-	State      string   `json:"state"`             // "done", "waiting"
-	Prompt     string   `json:"prompt"`            // user input (markdown)
-	Reply      string   `json:"reply,omitempty"`   // assistant output (HTML)
-	Markdown   string   `json:"md,omitempty"`      // assistant output (markdown)
+	State      string   `json:"state"`           // "done", "waiting"
+	Prompt     string   `json:"prompt"`          // user input (markdown)
+	Reply      string   `json:"reply,omitempty"` // assistant output (HTML)
+	Markdown   string   `json:"md,omitempty"`    // assistant output (markdown)
 	Documents  []any    `json:"documents,omitempty"`
 	BranchList []string `json:"branch_list,omitempty"`
 	// Profile snapshot used for this turn (model, name, etc.). We don't
@@ -404,16 +404,16 @@ type ThreadMessage struct {
 // ThreadDetail is what the embedded `json-thread` + `json-message-list`
 // islands deserialise into — full structured fidelity, no HTML scraping.
 type ThreadDetail struct {
-	ID        string          `json:"id"`
-	Title     string          `json:"title"`
-	Ack       string          `json:"ack,omitempty"`
-	CreatedAt string          `json:"created_at,omitempty"`
-	Saved     bool            `json:"saved"`
-	Shared    bool            `json:"shared"`
-	BranchID  string          `json:"branch_id,omitempty"`
-	TagIDs    []string        `json:"tag_ids"`
+	ID        string           `json:"id"`
+	Title     string           `json:"title"`
+	Ack       string           `json:"ack,omitempty"`
+	CreatedAt string           `json:"created_at,omitempty"`
+	Saved     bool             `json:"saved"`
+	Shared    bool             `json:"shared"`
+	BranchID  string           `json:"branch_id,omitempty"`
+	TagIDs    []string         `json:"tag_ids"`
 	Profile   AssistantProfile `json:"profile,omitempty"`
-	Messages  []ThreadMessage `json:"messages"`
+	Messages  []ThreadMessage  `json:"messages"`
 }
 
 // LastMessageID returns the id of the most recent turn — the value to pass
@@ -464,6 +464,13 @@ func (c *Client) showThread(ctx context.Context, threadID string, retried bool) 
 			}
 			return c.showThread(ctx, threadID, true)
 		}
+		// Kagi serves 404 both for "no such thread" and "unauthenticated".
+		// We only retry once; a second 404 after a fresh login is almost
+		// certainly a real not-found, so map it to ErrNotFound rather than
+		// reporting an auth failure.
+		if retried && resp.StatusCode == http.StatusNotFound {
+			return ThreadDetail{}, fmt.Errorf("thread %s: %w", threadID, ErrNotFound)
+		}
 		return ThreadDetail{}, fmt.Errorf("auth failed (status %d)", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -485,7 +492,10 @@ func parseThreadDetail(body []byte) (ThreadDetail, error) {
 	d := ThreadDetail{}
 	tm := jsonThreadRE.FindSubmatch(body)
 	if tm == nil {
-		return d, errors.New("json-thread island not found in /assistant/<id>")
+		// Kagi serves a 200 page with no json-thread island for unknown
+		// thread ids (the layout still has <div id="chat_box"></div> but no
+		// island). Treat that as not-found so the HTTP API can return 404.
+		return d, fmt.Errorf("no json-thread island in /assistant/<id>: %w", ErrNotFound)
 	}
 	if err := json.Unmarshal([]byte(html.UnescapeString(string(tm[1]))), &d); err != nil {
 		return d, fmt.Errorf("decode json-thread: %w", err)

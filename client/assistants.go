@@ -23,15 +23,18 @@ const (
 // means "create"; ID set means "update". Fields with zero values are sent as
 // such — there is no merge behaviour on the server, every update is a full
 // rewrite.
+//
+// JSON tags use snake_case so the HTTP API responses are consumable by
+// non-Go callers without case-conversion glue.
 type CustomAssistantSpec struct {
-	ID               string // empty → create
-	Name             string // required
-	BaseModel        string // model id, e.g. "claude-4-sonnet"
-	Instructions     string // system prompt
-	BangTrigger      string // optional bang command (e.g. "code" → !code prompt)
-	InternetAccess   bool
-	Personalizations bool
-	LensID           string // "0" or "" = no lens
+	ID               string `json:"id,omitempty"` // empty → create
+	Name             string `json:"name"`         // required
+	BaseModel        string `json:"base_model"`   // model id, e.g. "claude-4-sonnet"
+	Instructions     string `json:"instructions"` // system prompt
+	BangTrigger      string `json:"bang_trigger"` // optional bang command
+	InternetAccess   bool   `json:"internet_access"`
+	Personalizations bool   `json:"personalizations"`
+	LensID           string `json:"lens_id"` // "0" or "" = no lens
 }
 
 // SaveCustomAssistant creates (when spec.ID is empty) or updates (when set)
@@ -100,7 +103,7 @@ func (c *Client) DeleteCustomAssistant(ctx context.Context, id string) error {
 		return fmt.Errorf("verify-before failed: %w", err)
 	}
 	if !containsProfileID(before, id) {
-		return fmt.Errorf("no custom assistant with id %s", id)
+		return fmt.Errorf("custom assistant %s: %w", id, ErrNotFound)
 	}
 	form := url.Values{}
 	form.Set("profile_id", id)
@@ -182,13 +185,23 @@ func (c *Client) fetchCustomAssistant(ctx context.Context, id string, retried bo
 	if err != nil {
 		return CustomAssistantSpec{}, err
 	}
-	spec.ID = id
+	// Kagi serves the create form (empty profile_id) for unknown ids — same
+	// 200 status, same layout, just empty values. Catch that here so we
+	// don't return a silently-empty spec; wrapping with ErrNotFound lets
+	// the HTTP API surface this as 404 instead of 502.
+	if spec.ID == "" {
+		return CustomAssistantSpec{}, fmt.Errorf("custom assistant %s: %w", id, ErrNotFound)
+	}
+	if spec.ID != id {
+		return CustomAssistantSpec{}, fmt.Errorf("server returned spec for %s when we asked for %s", spec.ID, id)
+	}
 	return spec, nil
 }
 
 var (
 	// Inputs span multiple lines (newlines+spaces inside the tag) for
 	// bang_trigger and others; (?s) so . matches newlines.
+	profileIDInputRE        = regexp.MustCompile(`(?s)<input[^>]*name="profile_id"[^>]*value="([^"]*)"`)
 	nameInputRE             = regexp.MustCompile(`(?s)<input[^>]*name="name"[^>]*value="([^"]*)"`)
 	bangTriggerInputRE      = regexp.MustCompile(`(?s)<input[^>]*name="bang_trigger"[^>]*value="([^"]*)"`)
 	customInstructionsRE    = regexp.MustCompile(`(?s)<textarea[^>]*name="custom_instructions"[^>]*>(.*?)</textarea>`)
@@ -200,6 +213,11 @@ var (
 
 func parseCustomAssistantForm(body []byte) (CustomAssistantSpec, error) {
 	spec := CustomAssistantSpec{}
+	if m := profileIDInputRE.FindSubmatch(body); m != nil {
+		spec.ID = html.UnescapeString(string(m[1]))
+	} else {
+		return spec, errors.New("custom_assistant edit page: no profile_id input — form layout changed")
+	}
 	if m := nameInputRE.FindSubmatch(body); m != nil {
 		spec.Name = html.UnescapeString(string(m[1]))
 	} else {
