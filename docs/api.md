@@ -239,11 +239,303 @@ This means a real 404 (e.g. malformed thread id) will also trigger one
 relogin attempt, but the retry will see the same 404 and surface it as the
 final error — no infinite loop.
 
-## Endpoints not yet captured
+## Thread list — `POST /assistant/thread_list`
 
-- Profile list / default profile
-- Thread list (sidebar load)
-- Thread detail / message history fetch
-- Thread delete / rename / tag operations
-- File upload (multimodal input)
-- Branch management (re-rolling responses creates new branch_ids)
+Sidebar pagination. Streamed in the same NUL-delimited Kagi protocol as
+`/assistant/prompt`, but only emits three event types: `hi`, `tags.json`, and
+`thread_list.html`.
+
+Request:
+
+```json
+{
+  "cursor": {
+    "ack": "2025-03-30T13:07:09Z",
+    "created_at": "2025-03-30T13:04:24Z",
+    "id": "0069d9df-fa0d-43c7-bcce-92faf4cc367b"
+  },
+  "limit": 100
+}
+```
+
+Pass `cursor: null` for page 1; pass the previous response's `next_cursor`
+verbatim for subsequent pages. The endpoint refuses to advance without a
+cursor — there is no pure offset/limit form.
+
+`thread_list.html` payload:
+
+```json
+{
+  "html": "<div class=\"hide-if-no-threads\" data-group-name=\"Today\">...</div>...",
+  "next_cursor": {"ack": "...", "created_at": "...", "id": "..."},
+  "has_more": true,
+  "count": 100,
+  "total_counts": null
+}
+```
+
+The `html` field contains server-rendered `<li class="thread">` entries
+grouped by date label (`Today`, `Previous 7 days`, `All time`). Each `<li>`
+exposes its metadata as data attributes:
+
+```html
+<li class="thread"
+    data-code="<thread-uuid>"
+    data-saved="true"
+    data-public="false"
+    data-tags="[]"
+    data-snippet="first ~80 chars of the prompt"
+    >
+  <a href="/assistant/<thread-uuid>">
+    <div class="title">LLM-generated title</div>
+    <div class="excerpt">echo of the snippet</div>
+  </a>
+</li>
+```
+
+`client.parseThreadHTML` extracts these via regex (HTML structure is stable;
+no JSON island for this endpoint).
+
+## Thread detail — `GET /assistant/<thread-uuid>`
+
+The full thread page. The conversation isn't streamed — it's embedded as two
+JSON islands the JS bundle hydrates into `<div id="chat_box">` on load:
+
+```html
+<div id="json-thread" hidden>{...}</div>
+<div id="json-message-list" hidden>[...]</div>
+```
+
+`json-thread` (single object):
+
+```json
+{
+  "id": "8869e6c6-...",
+  "title": "Greeting",
+  "ack": "2026-05-02T08:37:47Z",
+  "created_at": "2026-04-30T18:10:35Z",
+  "saved": true,
+  "shared": false,
+  "branch_id": "00000000-0000-4000-0000-000000000000",
+  "tag_ids": [],
+  "profile": { /* full AssistantProfile snapshot */ }
+}
+```
+
+`json-message-list` (array, oldest first). Each entry represents one **turn**
+(user prompt + assistant reply paired into a single record):
+
+```json
+{
+  "id": "a3fb461b-...",
+  "thread_id": "8869e6c6-...",
+  "created_at": "2026-04-30T18:10:35Z",
+  "branch_list": ["00000000-0000-4000-0000-000000000000"],
+  "state": "done",
+  "prompt": "user input (markdown)",
+  "reply": "<p>assistant output (HTML)</p>",
+  "md": "assistant output (markdown)",
+  "profile": { /* AssistantProfile used for this turn */ },
+  "metadata": "<li>...billing HTML...</li>",
+  "documents": []
+}
+```
+
+The **last entry's `id`** is the value to pass as `focus.message_id` when
+continuing the conversation — this is what made the previous "--parent
+required with -t" CLI restriction obsolete.
+
+The `<div id="chat_box">` itself is empty in the server response; the
+browser populates it from `json-message-list` after page load. Don't bother
+parsing the chat-bubble templates.
+
+## Thread modify — `POST /assistant/thread_modify`
+
+Bulk rename / save / share / re-tag. Streamed protocol, only emits `hi`.
+
+```json
+{
+  "threads": [
+    {
+      "id": "8869e6c6-...",
+      "title": "New Title",
+      "saved": true,
+      "shared": false,
+      "tag_ids": []
+    }
+  ]
+}
+```
+
+Send the **complete current state** for each thread, not a diff — the server
+overwrites every listed field. If `title` is empty the server keeps the
+existing title; everything else is required.
+
+## Thread delete — `POST /assistant/thread_delete`
+
+Same shape as `thread_modify`:
+
+```json
+{
+  "threads": [
+    {"id": "<uuid>", "title": "...", "saved": true, "shared": false, "tag_ids": []}
+  ]
+}
+```
+
+A bare `[{"id":"..."}]` envelope works for some thread states but the JS
+client always sends the full snapshot — so do we (`client.DeleteThreads`
+fetches each thread first to fill in the metadata).
+
+## Thread search — `POST /assistant/search`
+
+Full-text search across the user's threads. Returns a **plain JSON array**
+(not the streamed Kagi protocol), one entry per matching message:
+
+```json
+[
+  {
+    "rank": 0.1,
+    "snippet": "...HTML with <b>matches</b>...",
+    "message_id": "7a11973a-...",
+    "branch_id": "00000000-0000-4000-0000-000000000000",
+    "thread_id": "8962a19b-..."
+  }
+]
+```
+
+Request:
+
+```json
+{"q": "search terms", "tag_id": null, "saved": null, "shared": null}
+```
+
+All filter fields are optional — omitted = no filter. `q` is matched against
+message bodies (not just titles), and the snippet shows the actual hit
+context.
+
+## Custom Assistant CRUD
+
+Driven from `/settings/custom_assistant` (the per-assistant edit page) and
+`/settings/assistant` (the listing page; reuses the embedded
+`json-profile-list` from `/assistant`). Both submission endpoints take
+`application/x-www-form-urlencoded` with **no CSRF token** — cookie auth is
+the only requirement.
+
+### `POST /settings/ast/profiles/update` — create or update
+
+Empty `profile_id` → create. Populated → update. Form fields:
+
+| Field                 | Required | Notes                                                  |
+| --------------------- | -------- | ------------------------------------------------------ |
+| `profile_id`          |          | Empty for create, UUID for update.                     |
+| `name`                | ✓        | Display name (must be unique within an account).        |
+| `base_model`          | ✓        | Model id (see `kagi models`).                           |
+| `custom_instructions` |          | System prompt. Send empty string to clear.              |
+| `bang_trigger`        |          | Optional bang command (e.g. `code` → `!code prompt`).   |
+| `internet_access`     |          | `on` (enabled) or `false` (disabled).                   |
+| `personalizations`    |          | `on` or `false`.                                        |
+| `selected_lens`       |          | Lens id, or `0` for none.                               |
+
+The form on the live page sends the checkbox both as a checkbox (value `on`,
+present only when checked) **and** a hidden fallback (value `false`). We
+collapse this into a single field that's always present with `on`/`false`.
+
+Success: 302 redirect back to `/settings/assistant`. No body, no echo of the
+new id — the client has to look the new profile up by name in the
+post-create profile list.
+
+Failure (validation error): 200 with the form re-rendered in HTML. The Go
+client surfaces this as an error.
+
+### `POST /settings/ast/profiles/delete`
+
+```
+profile_id=<uuid>
+```
+
+302 to `/settings/assistant` on success. Cannot delete the default profile —
+server returns 302 *back* to `/settings/assistant` with an error flash, which
+is HTTP-indistinguishable from the success redirect. The Go client brackets
+the POST with two `FetchProfiles` calls to verify the id existed beforehand
+and is gone afterward, surfacing both "no such id" and "delete rejected" as
+errors instead of silently succeeding.
+
+### `GET /settings/custom_assistant?id=<uuid>` — edit page (read side)
+
+The form's *current* values for an existing assistant. Used by the Go client
+to support partial updates: fetch → mutate the fields the caller cares
+about → POST the whole form back to `/settings/ast/profiles/update`. The
+fields available on the page mirror the create form exactly:
+
+- `<input name="name" value="...">`
+- `<input name="bang_trigger" value="...">`
+- `<textarea name="custom_instructions">...</textarea>` (HTML-entity encoded)
+- `<input name="internet_access" type="checkbox" value=on [checked]>`
+- `<input name="personalizations" type="checkbox" value=on [checked]>`
+- `<input name="base_model" type="radio" value="..." [checked]>` (one per available model)
+- `<input name="selected_lens" type="radio" value="..." [checked]>` (`value="0"` = no lens)
+
+There's no JSON island for this page — it's a plain HTML form. The Go
+client (`parseCustomAssistantForm`) extracts each field by regex.
+
+## File upload — `POST /assistant/prompt` (multipart variant)
+
+Files attach to a regular prompt request via `multipart/form-data` instead
+of the JSON-encoded form. The browser builds the body as:
+
+```
+Content-Type: multipart/form-data; boundary=...
+
+--boundary
+Content-Disposition: form-data; name="state"
+Content-Type: application/json
+
+{"focus":{...},"profile":{...},"threads":[...]}
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="screenshot.png"
+Content-Type: image/png
+
+<binary>
+
+--boundary
+Content-Disposition: form-data; name="__kagithumbnail"; filename="screenshot.png"
+Content-Type: image/jpeg
+
+<binary>  // 84x84 jpeg, only for images
+--boundary--
+```
+
+Notes:
+
+- The `state` field carries the same JSON envelope as the unilaterally
+  JSON-encoded request. No new fields — `documents: []` in
+  `new_message.json` will be populated server-side once attachments are
+  processed.
+- Each file is appended as `name="file"` (one entry per file).
+- For images, the browser also generates an 84×84 thumbnail (downscaled to
+  60% JPEG quality) and appends it as `name="__kagithumbnail"`. The server
+  uses this for the upload preview UI. Non-image uploads omit the thumb.
+- Don't set `Content-Type` manually; let the HTTP client set the multipart
+  boundary.
+- `Accept: application/vnd.kagi.stream` and the rest of the streaming
+  response protocol are unchanged.
+
+Not yet wired into the Go client (see `docs/todo.md`).
+
+## Other action endpoints (not exposed in the CLI)
+
+Captured from the JS bundle, listed for completeness:
+
+- `POST /assistant/stop/{trace_id}` — abort an in-flight streaming response.
+  The `trace_id` is the value emitted on the first `new_message.json` of a
+  prompt response.
+- `POST /assistant/message_regenerate` — re-roll an assistant turn (creates a
+  new branch under the same parent).
+- `POST /assistant/message_edit` — rewrite a user message and re-run the
+  thread from that point.
+- `POST /assistant/thread_open` — likely warms a thread; not investigated.
+- `POST /assistant/tags/{create,modify,delete}` — tag CRUD. Bodies:
+  `tags/create: [{name, color, icon_ref}]`, `tags/modify: [{id, name, color,
+  icon_ref}]`, `tags/delete: [<tag-id>]`.

@@ -14,42 +14,84 @@ likely materializes a synthetic profile when the user picks them in the UI).
 We just hide them from `kagi profiles`. If we ever want them, capture what
 the UI sends when one is picked.
 
-## Thread list / history
+## ~~Thread list / history~~ ✓ done
 
-- Sidebar loads threads on `/assistant` page load. Likely backed by a JSON
-  endpoint like `/assistant/threads` or similar — needs capture.
-- Add `kagi threads list` and `kagi threads show <id>` so callers can resume
-  conversations without holding state externally.
-- Once we have history, the "head message of thread X" lookup becomes
-  feasible — we could relax the `--parent` requirement.
+- `POST /assistant/thread_list` (cursor + limit). Response is the streamed
+  Kagi protocol with a `thread_list.html` event carrying server-rendered
+  `<li class="thread">` HTML — parsed back to typed structs by
+  `client.parseThreadHTML`.
+- `GET /assistant/<id>` carries two embedded JSON islands (`json-thread`,
+  `json-message-list`) with the full thread + per-turn data. The chat
+  bubbles in the page are populated client-side from these — don't bother
+  scraping them.
+- `POST /assistant/thread_modify` and `/assistant/thread_delete` take the
+  same `{threads:[{id,title,saved,shared,tag_ids}]}` envelope.
+- `POST /assistant/search` returns a flat `[{rank, snippet, message_id,
+  thread_id, branch_id}]` array (no streaming).
+- CLI: `kagi threads list/show/search/rename/save/unsave/share/unshare/delete`.
 
-## File upload (multimodal)
+The "head message of thread X" lookup now exists, so `kagi chat -t <id>`
+auto-resolves `--parent` from the last turn's `id`. Manual `--parent` is
+still accepted for explicit control or for restoring an old branch.
 
-- The composer area has a paperclip icon (`📎`). Drag-drop or click likely
-  POSTs to a `/assistant/upload` style endpoint and returns a file id that
-  goes into `focus.documents` (the `documents: []` field in the captured
-  responses).
-- Add `kagi chat -f file1.pdf -f file2.png "summarize these"`.
+## File upload (multimodal) — **next**
+
+Captured but not wired in. The composer's paperclip just adds files to a
+local queue; submission switches the prompt request from JSON to
+`multipart/form-data` with these parts:
+
+- `state` — the same JSON envelope, as a `application/json` blob.
+- `file` (one part per attachment) — the raw file bytes.
+- `__kagithumbnail` (one per image) — an 84×84 60%-quality JPEG the client
+  pre-generates, used for the in-UI preview.
+
+Plan when picking this up:
+
+1. Add `client.PromptRequest.Files []PromptFile` and a `Send`/`Stream`
+   variant that switches to multipart when `Files` is non-empty.
+2. Image thumbnails: pure-Go resize is heavy; either skip the thumb (Kagi
+   accepts uploads without one) or pull in `golang.org/x/image/draw`. Skip
+   for v1, document the trade-off.
+3. CLI: `kagi chat -f file1.pdf -f file2.png "summarize these"`.
+4. Server: accept `multipart/form-data` on `/chat` with the same field
+   layout, or expose `/chat/upload` returning a file-id (none of the
+   captured traffic does this — uploads always ride the prompt request).
+
+Worth doing — this is the only major capability the browser has that the
+CLI doesn't.
 
 ## Branch management
 
-- Re-rolling a response creates a new `branch_id`. Currently we always pin to
-  the zero UUID. To support re-rolls / forks, we'd need to:
-  - Capture the re-roll request (likely the same endpoint with a non-zero
-    `branch_id`).
-  - Parse `messages.json[].branch_list` to know which branches exist.
+- Re-rolling a response creates a new `branch_id` (`branch_list` in
+  `json-message-list` shows existing branches per turn).
+- `POST /assistant/message_regenerate` creates the new branch (captured in
+  the JS bundle, not yet replayed).
+- `POST /assistant/message_edit` rewrites a user message and re-runs the
+  thread from that point.
 - Probably low priority for automation.
 
 ## Lens support
 
-- `profile.lens_id` is currently always `null`. Lenses scope the assistant's
-  search to specific domains. Capture would just be: open a lens-enabled
-  profile, send a prompt, see what lens_id is included.
+- `profile.lens_id` is currently always `null`. Lenses scope the
+  assistant's search to specific domains. The custom-assistant create form
+  captured a list of lens ids (`0` = none, then small ints like `4248`,
+  `29`, `5648`, ...). `kagi assistants create --lens <id>` already plumbs
+  this through; the pieces missing are (a) a `kagi lenses list` command to
+  show the available lens ids by name, and (b) per-prompt lens override
+  via `chat --lens <id>` (currently the lens is whatever the profile sets).
 
-## Custom Assistant CRUD
+## ~~Custom Assistant — update flow~~ ✓ done
 
-- `/settings?p=custom_assistant` page handles create/edit/delete. Would let us
-  manage profiles programmatically. Lower priority — UI is fine for this.
+`kagi assistants update <uuid> [-n] [-m] [--prompt] [--bang] [--internet|
+--no-internet] [--personalize|--no-personalize] [--lens]`. Partial updates
+work because the Go client first scrapes `/settings/custom_assistant?id=<uuid>`
+to read the current state (name, base_model, bang_trigger,
+custom_instructions, lens, internet/personalizations checkboxes), applies
+only the flags the user actually passed, and then re-submits the whole form.
+Round-trip verified: rename-only preserves prompt + flags.
+
+`kagi assistants show <uuid>` is the read-side of the same scraper — useful
+for review or for piping into a script that builds a new spec.
 
 ## ~~Session refresh~~ ✓ done
 
@@ -74,7 +116,10 @@ cached sessions. Defer until someone actually has this problem.
 
 The stream parser (`client.parseStream`) is the bit most likely to break if
 Kagi tweaks the protocol. A small table-driven test against synthetic
-NUL-delimited input would catch regressions cheaply.
+NUL-delimited input would catch regressions cheaply. Same logic now also
+runs through `client.streamJSON` (used by thread_list / thread_modify /
+thread_delete) — adding a fixture for the `thread_list.html` payload would
+guard against the HTML-shape changes too.
 
 ## Integration with `~/dev/life-assistant`
 

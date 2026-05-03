@@ -86,3 +86,96 @@ glm-4-7-thinking, glm-5-1, glm-5-1-thinking
 kagi_session   .kagi.com  HttpOnly Secure SameSite=Lax  required
 _kagi_search_  kagi.com   HttpOnly Secure SameSite=Lax  search-only, ignored
 ```
+
+## Sample 3 — `POST /assistant/thread_list`
+
+Captured 2026-05-02. The browser sends a cursor-paginated request when the
+user clicks "Load more" in the sidebar.
+
+**Request:**
+
+```http
+POST /assistant/thread_list HTTP/1.1
+Cookie: kagi_session=...
+Content-Type: application/json
+Accept: application/vnd.kagi.stream
+
+{"cursor":{"ack":"2025-03-30T13:07:09Z","created_at":"2025-03-30T13:04:24Z","id":"0069d9df-fa0d-43c7-bcce-92faf4cc367b"},"limit":100}
+```
+
+**Response (NUL-delimited, abbreviated):**
+
+```
+hi:{"v":"202604301508.stage.86e133f","trace":"eeb06148ddd7031ee07c41ae3640748b"}\0
+tags.json:[]\0
+thread_list.html:{"html":"<div class=\"hide-if-no-threads\" data-group-name=\"Today\"><ul class=\"thread-list\"><li class=\"thread\" data-code=\"...\" data-saved=\"true\" data-public=\"false\" data-tags=\"[]\" data-snippet=\"...\"><a href=\"/assistant/...\"><div class=\"title\">...</div></a></li>...</ul></div>\n...","next_cursor":{"ack":"2025-02-03T05:41:26Z","created_at":"2025-02-03T02:15:51Z","id":"8d6bcad7-..."},"has_more":true,"count":100,"total_counts":null}\0
+```
+
+The first request (page 1) sends `"cursor": null`. Subsequent requests pass
+the previous response's `next_cursor` verbatim. `has_more=false` ends
+pagination.
+
+## Sample 4 — `GET /assistant/<thread-uuid>` JSON islands
+
+Two hidden divs near the bottom of the thread page carry the structured data
+the JS hydrates from. The chat bubbles in `<div id="chat_box"></div>` are
+empty in the server response — they're populated client-side from these.
+
+```html
+<div id="json-thread" hidden>{&quot;id&quot;:&quot;8869e6c6-...&quot;,&quot;title&quot;:&quot;Greeting&quot;,&quot;ack&quot;:&quot;2026-05-02T08:37:47Z&quot;,&quot;created_at&quot;:&quot;2026-04-30T18:10:35Z&quot;,&quot;saved&quot;:true,&quot;shared&quot;:false,&quot;branch_id&quot;:&quot;00000000-0000-4000-0000-000000000000&quot;,&quot;profile&quot;:{...},&quot;tag_ids&quot;:[]}</div>
+
+<div id="json-message-list" hidden>[{&quot;id&quot;:&quot;a3fb461b-...&quot;,&quot;thread_id&quot;:&quot;8869e6c6-...&quot;,&quot;created_at&quot;:&quot;2026-04-30T18:10:35Z&quot;,&quot;branch_list&quot;:[&quot;0000...&quot;],&quot;state&quot;:&quot;done&quot;,&quot;prompt&quot;:&quot;...user input...&quot;,&quot;reply&quot;:&quot;<p>...HTML...</p>&quot;,&quot;md&quot;:&quot;...markdown...&quot;,&quot;profile&quot;:{...},&quot;metadata&quot;:&quot;<li>...&quot;,&quot;documents&quot;:[]},...]</div>
+```
+
+Decode with `html.UnescapeString` then `json.Unmarshal`. The last entry's
+`id` is the parent for the next prompt.
+
+## Sample 5 — `POST /assistant/search`
+
+Returns a flat JSON array, not the streamed Kagi protocol. One entry per
+matching message (a thread can have multiple hits).
+
+**Request:**
+
+```http
+POST /assistant/search HTTP/1.1
+Content-Type: application/json
+
+{"q":"Greeting","tag_id":null,"saved":null,"shared":null}
+```
+
+**Response:**
+
+```json
+[
+  {
+    "rank": 0.1,
+    "snippet": "<b>greeting</b> = hour < 12 ? 'Good morning' : ...",
+    "message_id": "7a11973a-47f0-4158-a5db-8952adb39b40",
+    "branch_id": "00000000-0000-4000-0000-000000000000",
+    "thread_id": "8962a19b-f5be-49e9-8f97-1047a367f118"
+  }
+]
+```
+
+## Sample 6 — Custom Assistant create
+
+**Request (form-encoded):**
+
+```http
+POST /settings/ast/profiles/update HTTP/1.1
+Cookie: kagi_session=...
+Content-Type: application/x-www-form-urlencoded
+Referer: https://kagi.com/settings/assistant
+
+profile_id=&name=My+Assistant&base_model=claude-4-sonnet&custom_instructions=You+are+a+helpful+assistant.&bang_trigger=&internet_access=on&personalizations=on&selected_lens=0
+```
+
+**Response:** 302 to `/settings/assistant`. No body. The created assistant's
+UUID has to be discovered by re-fetching the profile list.
+
+For update, populate `profile_id` with the existing UUID — the server
+overwrites every field with whatever's in the form (no merge).
+
+For delete: `POST /settings/ast/profiles/delete` with `profile_id=<uuid>`,
+also returns 302 on success.
