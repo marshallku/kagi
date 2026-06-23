@@ -91,11 +91,13 @@ func (s *Server) buildPrompt(req chatRequest) (client.PromptRequest, error) {
 		return client.PromptRequest{}, fmt.Errorf("message_id required when thread_id is set (or call resolveAutoParent first)")
 	}
 	profileID := req.ProfileID
-	if profileID == "" {
-		profileID = s.defaultProfileID
-	}
 	model := req.Model
-	if model == "" {
+	// Fall back to the host's configured defaults only when the caller named
+	// NEITHER a model nor a profile. If they explicitly passed one (e.g. a
+	// base model with profile_id ""), honour that intent rather than forcing
+	// the default profile on top of it.
+	if profileID == "" && model == "" {
+		profileID = s.defaultProfileID
 		model = s.defaultModel
 	}
 	// v2 needs at least one of model (base) or profile_id (custom assistant);

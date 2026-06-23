@@ -472,6 +472,10 @@ func relaySSE(r io.Reader, convUUID string, out chan<- Event) error {
 	br := bufio.NewReader(r)
 	var dataBuf bytes.Buffer
 	titleSent := ""
+	// `text` and `html_content` are cumulative but arrive on different frames —
+	// the terminal frame typically carries only `text`. Track the latest
+	// non-empty value of each so the final new_message has both populated.
+	lastText, lastHTML := "", ""
 
 	flush := func() error {
 		if dataBuf.Len() == 0 {
@@ -499,17 +503,24 @@ func relaySSE(r io.Reader, convUUID string, out chan<- Event) error {
 			b, _ := json.Marshal(map[string]string{"id": cid, "title": ev.ConversationTitle})
 			out <- Event{Type: "thread.json", Data: b}
 		}
+		if ev.Text != "" {
+			lastText = ev.Text
+		}
+		if ev.HTMLContent != "" {
+			lastHTML = ev.HTMLContent
+		}
 		// Incremental tokens (text is cumulative).
 		tok, _ := json.Marshal(map[string]string{"text": ev.Text, "id": ev.AssistantMessageID})
 		out <- Event{Type: "tokens.json", Data: tok}
-		// Terminal frame.
+		// Terminal frame: the final SSE frame usually carries only `text`, so
+		// fall back to the last seen cumulative values for both fields.
 		if ev.IsFinal {
 			done, _ := json.Marshal(map[string]any{
 				"id":        ev.AssistantMessageID,
 				"thread_id": cid,
 				"state":     "done",
-				"reply":     ev.HTMLContent,
-				"md":        ev.Text,
+				"reply":     lastHTML,
+				"md":        lastText,
 			})
 			out <- Event{Type: "new_message.json", Data: done}
 		}
