@@ -94,15 +94,14 @@ func (s *Server) buildPrompt(req chatRequest) (client.PromptRequest, error) {
 	if profileID == "" {
 		profileID = s.defaultProfileID
 	}
-	if profileID == "" {
-		return client.PromptRequest{}, fmt.Errorf("profile_id required (per-request or run: kagi config set profile <uuid>)")
-	}
 	model := req.Model
 	if model == "" {
 		model = s.defaultModel
 	}
-	if model == "" {
-		return client.PromptRequest{}, fmt.Errorf("model required (per-request or run: kagi config set model <id>)")
+	// v2 needs at least one of model (base) or profile_id (custom assistant);
+	// a profile carries its own default model.
+	if profileID == "" && model == "" {
+		return client.PromptRequest{}, fmt.Errorf("model or profile_id required (per-request or run: kagi config set model <id>)")
 	}
 	internet := true
 	if req.InternetAccess != nil {

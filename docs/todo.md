@@ -2,6 +2,48 @@
 
 Ordered roughly by usefulness for automation.
 
+## ~~v2 protocol migration~~ ✓ done (2026-06-23)
+
+Kagi moved the Assistant to **`assistant.kagi.com`** with a JSON REST API
+under `/api/*`; the old `kagi.com/assistant/*` protocol was decommissioned.
+The client layer was rewritten against v2 and verified end-to-end (chat
+new/follow-up/stream, base model + custom assistant, threads list/show/
+rename/search, models, profiles, assistants show, HTTP server). Auth
+(`kagi_session` cookie shared on `.kagi.com`) was the only piece reused as-is.
+
+What changed:
+
+1. `client/client.go` — host split (`APIBase = assistant.kagi.com` for `/api/*`,
+   `BaseURL = kagi.com` for sign-in). `apiDo` JSON helper with 401-relogin and
+   404→ErrNotFound. Three-step chat (`POST /api/conversations` →
+   `POST /api/branches/{b}/messages` → `GET .../stream`). `relaySSE` parses the
+   `text/event-stream` and re-emits v1-style events (`thread.json`/`tokens.json`/
+   `new_message.json`) so `Send` and the HTTP server's snoop+relay stay unchanged.
+2. `client/discovery.go` — `FetchInit` over `/api/init`; `FetchProfiles`
+   synthesises the v1 AssistantProfile list from `models.models[]` +
+   `custom_assistants[]` so `kagi models`/`kagi profiles` and the server
+   discovery handlers compile unchanged.
+3. `client/threads.go` — conversations mapped onto the v1 thread types/methods.
+4. `client/assistants.go` — `/api/assistants` JSON REST CRUD.
+5. CLI/server — relaxed the "profile required" rule (v2 needs model **or**
+   profile); everything else (command verbs, HTTP routes, `ChatResult`) preserved.
+6. `client/client_test.go` — table-driven `relaySSE` tests (the fragile bit).
+
+### Follow-ups (deferred)
+
+- **Stale config caveat**: a v1 `profile` uuid in `~/.config/kagi/config.json`
+  no longer resolves and yields a (now friendlier) "profile not found" error.
+  Users must re-set it from `kagi profiles`. Consider auto-detecting/clearing.
+- **Conversation list pagination**: `ListThreads` reads `/api/init` (likely a
+  capped page). A dedicated paginated `/api/conversations?...` endpoint exists;
+  wire cursor pagination if large histories truncate.
+- **New v2 capabilities** not yet surfaced: folders (`/api/folders*`), file
+  upload (`/api/upload*`, multimodal), branch management
+  (`/api/conversations/{id}/branches`, re-roll/edit), sharing
+  (`/api/branches/{b}/share`), `thinking_preset` for reasoning models,
+  `/api/conversations/by-legacy/{id}` (v1→v2 id mapping).
+- **README**: refresh the stale model-id examples (e.g. `grok-4-20`).
+
 ## ~~Profile / model discovery~~ ✓ done
 
 `kagi models` and `kagi profiles` parse `<div id="json-profile-list">` from

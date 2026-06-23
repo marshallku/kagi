@@ -154,11 +154,11 @@ func chatCmd(args []string) {
 		fmt.Fprintf(os.Stderr, "[resuming thread=%s title=%q]\n", last.ThreadID, last.Title)
 	}
 
-	if *profile == "" {
-		die("profile not set; pass -p or run: kagi config set profile <uuid> (see: kagi profiles)")
-	}
-	if *model == "" {
-		die("model not set; pass -m or run: kagi config set model <id>")
+	// v2 needs at least one of model (base model) or profile (custom
+	// assistant). A profile carries its own default model, so model is
+	// optional when a profile is set, and vice versa.
+	if *profile == "" && *model == "" {
+		die("set a model or profile; pass -m/-p or run: kagi config set model <id> (see: kagi models / kagi profiles)")
 	}
 	if *asJSON && *stream {
 		die("--json and --stream are mutually exclusive")

@@ -1,541 +1,537 @@
-# Kagi Assistant — reverse-engineering notes
+# Kagi Assistant — reverse-engineering notes (v2)
 
-Captured 2026-04-28 by driving a logged-in browser via the ai-browser MCP and
-inspecting network traffic for `kagi.com/assistant`.
+Captured 2026-06-23 by driving a logged-in browser via `tabd` and inspecting
+network traffic for the **new** `assistant.kagi.com` app.
 
-## Authentication
+> **Breaking change (2026-06).** Kagi moved the Assistant off `kagi.com/assistant`
+> onto a dedicated **`assistant.kagi.com`** SvelteKit SPA backed by a JSON REST
+> API under `/api/*`. The old NUL-delimited `application/vnd.kagi.stream`
+> protocol on `kagi.com/assistant/*` is **decommissioned**:
+>
+> - `kagi.com/assistant` → 301/302 to `assistant.kagi.com/`.
+> - `POST kagi.com/assistant/prompt` → HTTP 500 (dead).
+> - The `<div id="json-profile-list">` discovery island is gone.
+>
+> The current Go client targets the old protocol and is therefore **broken for
+> chat**. Only the auth layer survives unchanged. The v1 protocol notes are
+> archived at the bottom of this file under "Legacy (decommissioned)".
 
-Cookie-based; no separate auth token, no CSRF for the streaming endpoint.
+## TL;DR — what changed
 
-| Cookie           | Domain     | Notes                                   |
-| ---------------- | ---------- | --------------------------------------- |
-| `kagi_session`   | `.kagi.com`| HttpOnly, Secure, SameSite=Lax. Required for `/assistant/prompt`. |
-| `_kagi_search_`  | `kagi.com` | Search session — not needed for the prompt API. |
+| Concern            | v1 (`kagi.com/assistant/*`)                              | v2 (`assistant.kagi.com/api/*`)                                  |
+| ------------------ | ------------------------------------------------------- | ---------------------------------------------------------------- |
+| Auth               | `kagi_session` cookie                                   | **same** `kagi_session` cookie (domain `.kagi.com`, shared)      |
+| Send a prompt      | one `POST /assistant/prompt`                            | three calls: create conv → post message → GET SSE stream         |
+| Stream format      | custom NUL-delimited `vnd.kagi.stream`                  | **standard SSE** (`text/event-stream`, `data: …` / `data: [DONE]`) |
+| Thread             | `thread_id` + `message_id` + zero `branch_id`           | `conversation_uuid` + `branch_uuid` + `head_message_uuid`        |
+| Discovery          | scrape `<div id="json-profile-list">` HTML              | `GET /api/init` (one JSON blob)                                  |
+| Profiles           | `profiles[]` (`id`, `model`, `custom_instructions`)     | `custom_assistants[]` (`uuid`, `llm_id`, `instructions`)         |
+| Thread list        | `POST /assistant/thread_list` (cursor, HTML)            | `GET /api/init` → `conversations.items[]` (JSON)                 |
+| Thread detail      | `GET /assistant/{id}` (HTML islands)                    | `GET /api/conversations/{uuid}/init` (JSON)                      |
+| Modify / delete    | `POST /assistant/thread_{modify,delete}` (full snapshot) | `PATCH` / `DELETE /api/conversations/{uuid}` (REST)             |
+| Search             | `POST /assistant/search`                                | `GET /api/search?q=…`                                            |
+| Assistant CRUD     | `POST /settings/ast/profiles/{update,delete}` (form)    | `/api/assistants`, `/api/assistants/{uuid}` (JSON REST)          |
+| Folders            | —                                                       | `/api/folders*` (new)                                            |
+| Upload             | multipart on `/assistant/prompt`                        | `/api/upload*` (dedicated, new)                                  |
 
-Sign-in form posts a `_csrf` hidden field, but follow-up XHRs to
-`/assistant/prompt` do **not** require it.
+## Authentication (unchanged)
 
-## Endpoint
+Cookie-based; the auth cookie is shared across `kagi.com` and
+`assistant.kagi.com` because it is set on the parent domain.
 
-Single endpoint handles both new conversations and follow-ups:
+| Cookie         | Domain      | Notes                                                      |
+| -------------- | ----------- | ---------------------------------------------------------- |
+| `kagi_session` | `.kagi.com` | HttpOnly, Secure, SameSite=Lax. Sent to both subdomains.   |
+| `_kagi_search_`| `kagi.com`  | Search session — not needed for the assistant API.         |
+
+The `/api/*` endpoints take the cookie only — **no CSRF token** on JSON calls
+(verified: create/delete conversations succeed with cookie auth alone).
+Unauthenticated requests to `/api/init` return **401** (clean, unlike the old
+404-as-auth-fail quirk).
+
+### Sign-in flow
+
+Unchanged from v1, except the "Login with Kagi" button on
+`assistant.kagi.com/` redirects to:
 
 ```
-POST https://kagi.com/assistant/prompt
-Cookie: kagi_session=...
-Accept: application/vnd.kagi.stream
-Content-Type: application/json
-Origin: https://kagi.com
-Referer: https://kagi.com/assistant
-User-Agent: <any normal browser UA>
+https://kagi.com/signin?r=https%3A%2F%2Fassistant.kagi.com%2F
 ```
 
-Response is `Transfer-Encoding: chunked`, `Content-Encoding: gzip`,
-`Content-Type: text/html` (yes, the streaming media type is `text/html` despite
-the `Accept` we send).
+The sign-in form is identical (`_csrf`, `r`, `email`, `password` fields;
+form action `POST /login`; 302 `Set-Cookie: kagi_session=…` on success). After
+login, `kagi.com` redirects back to `assistant.kagi.com/` and the shared
+cookie authenticates the SPA. See "Sign-in flow" under Legacy below — the
+mechanics are the same; only the `r` redirect target changed.
 
-### Request — new thread
+## Error envelope
+
+All `/api/*` errors share a typed envelope:
 
 ```json
 {
-  "focus": {
-    "thread_id": null,
-    "branch_id": "00000000-0000-4000-0000-000000000000",
-    "prompt": "What is 2+2? Answer in one word."
-  },
-  "profile": {
-    "id": "85988101-51a4-4e88-8a27-36231e98fae2",
-    "personalizations": true,
-    "internet_access": true,
-    "model": "grok-4-20",
-    "lens_id": null
-  },
-  "threads": [{ "tag_ids": [], "saved": true, "shared": false }]
+  "error": {
+    "code": "validation_error",
+    "message": "Field required",
+    "request_id": "8287e0a4-…",
+    "fields": [{"loc": ["query", "q"], "message": "Field required", "type": "missing"}]
+  }
 }
 ```
 
-### Request — follow-up to existing thread
+Observed codes: `validation_error` (422), `method_not_allowed` (405),
+plus standard 401/404. `fields[].loc` follows FastAPI/Pydantic-style
+`[location, name]` tuples — handy for discovering required params.
+
+## Bootstrap — `GET /api/init`
+
+One call returns the entire app state. Top-level keys:
+
+```
+conversations          {items: [...], ...}   — thread list (see below)
+counts                                          — sidebar counters
+folders                [...]                    — folder tree (new)
+folder_customization
+models                 {models, assistants, default, sections}
+lenses
+language               "en"
+legacy_import                                    — migration status from v1
+settings               {...}                     — user settings (see below)
+custom_assistants      [...]                     — custom assistants (was profiles)
+active_conversation    null | {...}
+active_error
+billing
+has_unlimited_access   bool
+```
+
+### `conversations.items[]` (was the thread list)
 
 ```json
 {
-  "focus": {
-    "thread_id": "751d32f2-bef8-43ae-b911-77de0afaed2e",
-    "branch_id": "00000000-0000-4000-0000-000000000000",
-    "prompt": "And 3+3?",
-    "message_id": "a5d5ad16-e537-4190-9218-45895818f55d"
-  },
-  "profile": { "...same shape as above..." }
+  "uuid": "77ecad85-…",
+  "title": "보안 점검용 프롬프트 개선 요청",
+  "is_saved": true,
+  "is_shared": false,
+  "is_pinned": false,
+  "model_name": "deepseek-v4-pro",
+  "icon": null,
+  "folder_uuid": null,
+  "created_at": "2026-06-23T02:59:09.812679",   // naive UTC, no 'Z'
+  "updated_at": "2026-06-23T03:01:10.831451",
+  "deleted_at": null,
+  "total_tokens": 2518,
+  "total_cost": 0.021,
+  "pinned_count": 0,
+  "message_count": 6,
+  "annotation_count": 0,
+  "has_branches": true,
+  "branch_count": 1,
+  "is_owner": true
 }
 ```
 
-Differences vs new:
+Timestamps are naive ISO-8601 (no timezone suffix) but are UTC.
 
-- `focus.thread_id` is a UUID (not null).
-- `focus.message_id` is the **parent** message UUID (the one being replied to).
-- `threads` array is omitted entirely.
-
-The `branch_id` is always the zero UUID (`00000000-0000-4000-0000-000000000000`)
-unless the thread has multiple branches (re-rolled responses). We don't yet
-exercise multi-branch flows.
-
-## Response stream protocol
-
-`application/vnd.kagi.stream` is a custom NUL-delimited record format.
-
-Each record: `<type>:<payload>\0` where `<type>` is a string like
-`tokens.json`, `<payload>` is JSON or HTML, and `\0` (NUL byte, `0x00`)
-terminates the record. Records may contain newlines internally — only the
-NUL is the delimiter. Newlines after `\0` are cosmetic.
-
-### Event types
-
-| Type                  | Payload                                                                |
-| --------------------- | ---------------------------------------------------------------------- |
-| `hi`                  | `{v, trace}` — server version + trace id, sent first.                  |
-| `thread.html`         | `<li>` HTML for the sidebar entry.                                     |
-| `thread.json`         | `{id, title, ack, created_at, saved, shared, branch_id, tag_ids}`.     |
-| `messages.json`       | Array of prior messages in the thread (empty for new threads).         |
-| `new_message.json`    | The pending message; emitted twice — first with `state: "waiting"`, last with `state: "done"` containing final `reply` (HTML) and `md` (Markdown). |
-| `tokens.json`         | `{text, id, padding}` — incremental tokens. **`text` is cumulative**, not a delta. `padding` is a random string (BREACH-attack mitigation). |
-
-The CLI prints from `new_message.json.md` at completion. The `--stream` mode
-diffs `tokens.json.text` against the last seen value to emit incremental output
-(but `text` is HTML, not Markdown — only the final `md` field is plain text).
-
-### Title generation
-
-`thread.json` is emitted twice. The first carries the user's prompt as the
-title; the second (after the response is generated) carries an LLM-generated
-title (e.g. "What is 2+2?" → "What Is 2+2?"). The client tracks the latest.
-
-## Models
-
-Discovered by inspecting the model-picker dropdown HTML on `/assistant`. List
-is dynamic; check the page directly to be sure.
-
-```
-ki_quick                       Kagi quick (cheap default)
-ki_research                    Kagi research
-ki_deep_research               Kagi deep research
-grok-4-20                      Grok 4.20 (xAI)
-claude-4-sonnet
-claude-4-sonnet-thinking
-claude-4-7-opus-thinking
-kimi-k2-5
-kimi-k2-5-thinking
-glm-4-7-thinking
-glm-5-1
-glm-5-1-thinking
-```
-
-The `profile.model` field overrides whatever default model the profile points
-to. Combined with `profile.id`, you can use a Custom Assistant's
-system-prompt/tooling but route to a different underlying model.
-
-## Profiles
-
-A "profile" in Kagi is a Custom Assistant — system prompt, default model,
-internet access toggle, lens, etc. The `profile.id` is a UUID.
-
-### Discovery: `<div id="json-profile-list" hidden>`
-
-The `/assistant` page embeds the **entire profile catalog** as escaped JSON
-inside a hidden div:
-
-```html
-<div id="json-profile-list" hidden>{&quot;profiles&quot;:[{&quot;id&quot;:&quot;...&quot;,...}]}</div>
-```
-
-Decode with `html.UnescapeString` then `json.Unmarshal`. Each entry:
+### `custom_assistants[]` (was profiles)
 
 ```json
 {
-  "id": "e47dcf40-61fc-4da5-99a0-2d403ac41c00",
-  "name": "수진",
-  "model": "claude-4-sonnet",
-  "model_name": "Claude 4.6 Sonnet",
-  "model_provider": "anthropic",
-  "model_provider_name": "Anthropic",
-  "accessible": true,
-  "deprecate": false,
-  "retired": false,
-  "recommended": false,
-  "is_default_profile": false,
-  "internet_access": false,
+  "uuid": "46896181-f355-4e9d-a6b4-cbd10f8d7455",
+  "name": "Claude",
+  "llm_id": "claude-4-sonnet-thinking",         // was "model"
+  "instructions": "You are an autoregressive…",  // was "custom_instructions"
+  "bang_trigger": null,
+  "internet_access": true,
   "personalizations": true,
-  "model_input_limit": 1000000
+  "lens_id": null,
+  "deprecated": false,
+  "retired": false,
+  "successor_model_name": null,
+  "created_at": "…",
+  "updated_at": "…"
 }
 ```
 
-The list contains BOTH base profiles (one per available model, mostly with
-empty `id` — system entries not user-selectable) AND user-created Custom
-Assistants. Filter by `id != ""` for what's usable as `profile_id`.
+### `models` = `{models, assistants, default, sections}`
 
-`kagi models` and `kagi profiles` are the CLI surface over this; both
-deduplicate and skip `deprecate`/`retired`/`!accessible` entries.
+`models.models[]` — each entry is far richer than v1's flat list:
 
-## Sign-in flow (captured 2026-04-28)
+```json
+{
+  "id": "ki_quick",
+  "provider": "kagi",
+  "provider_label": "K",
+  "display_name": "Quick",
+  "context_window": 128000,
+  "supports_thinking": false,
+  "thinking_presets": null,
+  "default_thinking_preset": null,
+  "capabilities": ["fast", "vision"],
+  "supported": true,
+  "recommended": false,
+  "scorecard": {"cost": 1, "speed": 5, "accuracy": 2, "privacy": 5, "release_date": "2026-05-22"},
+  "internet_access": true,
+  "requires_search": true,
+  "access_level": "standard",
+  "deprecated": false,
+  "retired": false,
+  "successor_model_id": null
+}
+```
+
+`models.sections` groups model ids for the picker UI; `models.default` is the
+default model id.
+
+### `settings`
+
+```json
+{
+  "custom_instructions": "I'm a web developer based in South Korea…",
+  "dark_theme": null,
+  "light_theme": null,
+  "font_size": null,
+  "submit_key": null,
+  "keyboard_shortcuts": null,
+  "default_builtin_profile_key": null,
+  "default_custom_profile_uuid": null,
+  "default_llm_id": null,
+  "default_selection_kind": "last_used",
+  "thread_retention_policy": "forever",   // "forever" | (default 24h auto-delete)
+  "upsell_dismissed": false,
+  "workspace_area": null
+}
+```
+
+> **Retention note.** New conversations are created with `is_saved: true`, but
+> Kagi auto-deletes unsaved threads after 24h unless the account's
+> `thread_retention_policy` is `forever`. The CLI should delete its own
+> throwaway test conversations rather than rely on auto-expiry.
+
+## Chat — three-step flow
+
+### 1. Create a conversation — `POST /api/conversations`
+
+```json
+// request
+{"model_name": "ki_quick"}
+```
+
+```json
+// response
+{
+  "conversation": {"uuid": "c97a4478-…", "title": "New chat", "model_name": "ki_quick", "message_count": 0, …},
+  "default_branch": {
+    "uuid": "12b540e3-…",                       // ← branch_uuid for step 2
+    "conversation_uuid": "c97a4478-…",
+    "head_message_uuid": null,
+    "branch_point_parent_uuid": null,
+    "branch_child_message_uuid": null,
+    "is_default": true,
+    "message_count": 0
+  }
+}
+```
+
+A conversation owns one or more **branches**; you post messages to a branch,
+not to the conversation directly.
+
+### 2. Post the user message — `POST /api/branches/{branch_uuid}/messages`
+
+```json
+// request
+{
+  "message": "What is 2+2? Answer in one word.",
+  "thinking_preset": null,         // model-dependent; null when supports_thinking=false
+  "model_name": "ki_quick",
+  "enable_search": true,           // was profile.internet_access
+  "personalization": true          // was profile.personalizations
+}
+```
+
+```json
+// response
+{
+  "branch": {"uuid": "1661ed71-…", "head_message_uuid": "13a37bb1-…", "message_count": 1, …},
+  "conversation": {…},
+  "user_message": {"uuid": "13a37bb1-…", "role": "user", "content": "What is 2+2?…", …},
+  "stream_url":        "/api/branches/1661ed71-…/stream",
+  "stream_status_url": "/api/branches/1661ed71-…/stream/status",
+  "stream_cancel_url": "/api/branches/1661ed71-…/stream/cancel"
+}
+```
+
+Use the returned `stream_url` (or build `…/stream?cursor=0-0`). Note the
+branch uuid in the *response* can differ from the one you posted to when the
+server forks a branch — always follow `stream_url`.
+
+### 3. Read the reply — `GET /api/branches/{branch_uuid}/stream?cursor=0-0`
+
+Standard **Server-Sent Events** (`text/event-stream; charset=utf-8`). Each
+event is `id:` + `data:` (JSON), separated by a blank line; the stream ends
+with a literal `data: [DONE]`.
+
+```
+id: 1782183846169-0
+data: {"text":"","conversation_uuid":"b1b1…","branch_uuid":"1661…","is_final":false,"conversation_title":"Mathematical Addition Result"}
+
+id: 1782183846172-0
+data: {"text":"","conversation_uuid":"b1b1…","branch_uuid":"1661…","is_final":false,"model_name":"ki_quick","html_content":"<p>Four</p>"}
+
+id: 1782183846424-0
+data: {"text":"Four","is_final":true,"model_name":"ki_quick","model_version":"ki_quick-2026-05-22",
+       "timing":{"prep_ms":0,"ttft_ms":290,"llm_streaming_ms":213,"finalize_ms":37,"backend_total_ms":542},
+       "usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4,"cost_usd":0.000012,"tokens_per_second":3.0},
+       "context_usage":{"context_window":128000,"total_used":4,"available":127996,"used_percent":0},
+       "duration_ms":300,"assistant_message_uuid":"8f4995a3-…",
+       "billing":{"limit":"none","can_proceed":true,"usage":{…},"ack":{"soft":false,"hard":false}}}
+
+data: [DONE]
+```
+
+Field notes:
+
+- **`text`** is the **cumulative** plain-text reply (not a delta). The final
+  event carries the complete text.
+- **`html_content`** is the cumulative rendered HTML.
+- **`conversation_title`** appears on (usually the first) non-final event — the
+  LLM-generated title. Persist the latest seen value.
+- **`is_final: true`** marks the terminal payload: full `usage`, `timing`,
+  `context_usage`, `billing`, and `assistant_message_uuid`.
+- `cursor=0-0` requests from the start; the `id` values (`<ms>-<seq>`) are
+  resumable cursors for reconnects.
+
+### Follow-up turns
+
+Post to the same conversation's branch again with the next
+`POST /api/branches/{branch_uuid}/messages`; the branch's `head_message_uuid`
+threads the reply onto the prior turn. Resolve the head via
+`GET /api/conversations/{uuid}/init` → `active_branch.head_message_uuid`.
+
+### Abort / status
+
+- `POST /api/branches/{branch_uuid}/stream/cancel` — stop an in-flight stream.
+- `GET  /api/branches/{branch_uuid}/stream/status` — poll stream state.
+
+## Conversation detail — `GET /api/conversations/{uuid}/init`
+
+```
+{
+  "conversation":   {…same shape as conversations.items[]…},
+  "branches":       [ {uuid, conversation_uuid, branch_name, message_count,
+                       head_message_uuid, branch_point_parent_uuid,
+                       branch_child_message_uuid, is_default, updated_at}, … ],
+  "active_branch":  { …one branch object… },
+  "messages":       { "items": [ … ], "has_more": false },
+  "context_usage":  {…}
+}
+```
+
+`messages.items[]` — one entry per message (user and assistant are separate
+rows, unlike v1's paired turns):
+
+```json
+{
+  "uuid": "…",
+  "role": "user" | "assistant",
+  "content": "markdown text",
+  "html_content": "<p>…</p>",
+  "thinking": null, "thinking_html": null,
+  "parent_message_uuid": "…",
+  "branch_name": null, "branch_links": null,
+  "sibling_count": 1, "sibling_index": 0, "sibling_uuids": [], "sibling_branch_uuids": [],
+  "model_name": "…", "model_display_name": "…", "model_provider": "…", "model_version": "…",
+  "input_tokens": …, "output_tokens": …, "cost_usd": …, "tokens_per_second": …, "duration_ms": …,
+  "references": [], "attachments": [],
+  "is_pinned": false, "annotation": null,
+  "profile_uuid": null, "profile_revision_id": null, "profile_name": null,
+  "created_at": "…"
+}
+```
+
+## Conversation management (REST)
+
+| Verb + path                                   | Purpose                                            |
+| --------------------------------------------- | -------------------------------------------------- |
+| `PATCH  /api/conversations/{uuid}`            | Rename / save / share / pin / move to folder.      |
+| `DELETE /api/conversations/{uuid}`            | Soft-delete (→ trash). Verified: 200, no CSRF.     |
+| `POST   /api/conversations/{uuid}/restore`    | Undo a soft-delete.                                |
+| `DELETE /api/conversations/{uuid}/permanent`  | Hard-delete.                                       |
+| `POST   /api/conversations/deleted/purge`     | Empty trash.                                       |
+| `GET    /api/conversations/{uuid}/branches`   | List branches.                                     |
+| `GET    /api/conversations/stats/counts`      | Sidebar counters.                                  |
+| `GET    /api/conversations/by-legacy/{oldId}` | **Map a v1 thread id → v2 conversation** (migration). |
+| `POST   /api/conversations/import`            | Import conversations.                              |
+
+PATCH body shape is the typed subset of the conversation object (e.g.
+`{"title": "…"}`, `{"is_saved": true}`, `{"folder_uuid": "…"}`) — send only
+the fields you change (REST partial update, not the v1 full-snapshot rule).
+*Exact accepted fields not yet exhaustively captured — confirm before relying.*
+
+## Search — `GET /api/search?q=…&limit=N`
+
+```json
+// GET /api/search?q=신생아&limit=2  →
+{
+  "items": [
+    {"conversation": {…full conversation object…}, "snippet": null, "rank": 0.182}
+  ],
+  "truncated": false
+}
+```
+
+`q` is **required** (422 if missing; `POST` → 405 — it is GET-only). Returns
+matching conversations with a relevance `rank`; `snippet` may be null.
+
+## Custom assistants — `/api/assistants`
+
+| Verb + path                  | Purpose                          |
+| ---------------------------- | -------------------------------- |
+| `GET    /api/assistants`     | List (also embedded in `/api/init` as `custom_assistants`). |
+| `POST   /api/assistants`     | Create.                          |
+| `GET    /api/assistants/{uuid}` | Read one.                     |
+| `PATCH  /api/assistants/{uuid}` | Update (partial).             |
+| `DELETE /api/assistants/{uuid}` | Delete.                       |
+
+Body fields mirror the `custom_assistants[]` read shape: `name`, `llm_id`,
+`instructions`, `bang_trigger`, `internet_access`, `personalizations`,
+`lens_id`. JSON, not form-encoded. *Create/update request bodies inferred from
+the read shape — capture a live create to confirm exact field names before
+implementing writes.*
+
+## Folders (new) — `/api/folders`
+
+| Verb + path                | Purpose                |
+| -------------------------- | ---------------------- |
+| `GET    /api/folders`      | List (also in `/api/init`). |
+| `POST   /api/folders`      | Create.                |
+| `PATCH  /api/folders/{uuid}` | Rename / recolor.    |
+| `DELETE /api/folders/{uuid}` | Delete.              |
+| `POST   /api/folders/reorder` | Reorder.            |
+
+Conversations reference a folder via `conversation.folder_uuid`.
+
+## File upload (new) — `/api/upload`
+
+Dedicated upload endpoints, separate from the prompt request (v1 rode files
+inline on `/assistant/prompt` as multipart):
+
+- `POST   /api/upload` — upload a file, returns a file id.
+- `GET    /api/upload/{id}` — fetch.
+- `POST   /api/upload/highlight/{id}` — (purpose unconfirmed).
+
+Attachments then surface on messages via `message.attachments[]`. Exact
+request shape not yet captured.
+
+## Sharing — `/api/branches/{branch}/share`, `/api/shares/{id}`
+
+- `POST   /api/branches/{branch_uuid}/share` — create a public share link.
+- `GET    /api/shares/{id}` — fetch a shared conversation.
+
+## Settings — `/api/settings`
+
+- `GET  /api/settings` — read (also in `/api/init.settings`).
+- `PATCH/POST /api/settings` — update (e.g. `custom_instructions`,
+  `thread_retention_policy`, default model/profile).
+
+## Legacy import — `/api/legacy-import/{status,retry}`
+
+Kagi migrates v1 threads to v2 conversations server-side. `/api/init` carries a
+`legacy_import` block with progress; `/api/legacy-import/status` polls it and
+`/api/legacy-import/retry` re-runs a failed import. `GET
+/api/conversations/by-legacy/{oldThreadId}` resolves an individual v1 thread id
+to its v2 conversation.
+
+## Billing — `/api/billing/{status,ack}`
+
+- `GET  /api/billing/status` — usage / limits (also embedded in the final
+  stream event's `billing` block and `/api/init.billing`).
+- `POST /api/billing/ack` — acknowledge a soft/hard limit warning.
+
+## Full endpoint inventory (from the SvelteKit bundle)
+
+```
+GET    /api/init
+GET    /api/settings                         POST /api/settings
+GET    /api/search?q=…
+
+POST   /api/conversations
+GET    /api/conversations/{uuid}             PATCH/DELETE /api/conversations/{uuid}
+GET    /api/conversations/{uuid}/init
+GET    /api/conversations/{uuid}/branches
+POST   /api/conversations/{uuid}/restore
+DELETE /api/conversations/{uuid}/permanent
+GET    /api/conversations/by-legacy/{oldId}
+POST   /api/conversations/import
+GET    /api/conversations/stats/counts
+POST   /api/conversations/deleted/purge
+
+POST   /api/branches/{branch}/messages
+GET    /api/branches/{branch}/stream         (SSE)
+POST   /api/branches/{branch}/stream/cancel
+GET    /api/branches/{branch}/stream/status
+POST   /api/branches/{branch}/share
+
+GET    /api/messages/{uuid}                  POST /api/messages/{uuid}/edit-response
+
+GET    /api/assistants                       POST /api/assistants
+GET    /api/assistants/{uuid}                PATCH/DELETE /api/assistants/{uuid}
+
+GET    /api/folders                          POST /api/folders          POST /api/folders/reorder
+PATCH/DELETE /api/folders/{uuid}
+
+POST   /api/upload                           GET /api/upload/{id}        POST /api/upload/highlight/{id}
+GET    /api/shares/{id}
+GET    /api/billing/status                   POST /api/billing/ack
+GET    /api/legacy-import/status             POST /api/legacy-import/retry
+GET    /api/_debug
+```
+
+Routes containing `{x}` are path-parameterised; verbs marked above are observed
+or inferred from the SPA. Write-body shapes flagged "inferred/unconfirmed"
+should be captured live before implementation.
+
+---
+
+# Legacy (decommissioned) — v1 protocol `kagi.com/assistant/*`
+
+> Retained for historical reference and for the migration mapping. These
+> endpoints no longer function for chat (`POST /assistant/prompt` → 500) and
+> the `/assistant` UI redirects to `assistant.kagi.com`. The **auth / sign-in
+> flow below is still accurate** and shared with v2.
+
+## Sign-in flow (captured 2026-04-28, still valid)
 
 Two-step: GET the form to capture CSRF + paired session cookie, then POST.
 
 ### GET /signin
 
-Returns the HTML sign-in page. The form contains a hidden `_csrf` token, plus
-the server sets cookies (anti-CSRF + a temp session) that **must** be replayed
-on the POST. Without those cookies, POST /login returns 403 even with a valid
-CSRF value.
+Returns the HTML sign-in page with a hidden `_csrf` token; the server sets
+anti-CSRF + temp-session cookies that **must** be replayed on the POST.
 
 ```html
-<form action="https://kagi.com/login" method="post" enctype="application/x-www-form-urlencoded">
-  <input type="hidden" name="_csrf" value="fJxHGYaotOG2P3-_OnyR_XlI_djnRUAzy1BwiNvc6CR06ouHelC4LeCTNkbelpD0X7mVNiiSm2ab67Bius63BA==">
-  <input type="hidden" name="r" value="/assistant">
-  <input type="text" name="email" autocomplete="username" required>
-  <input type="password" name="password" autocomplete="current-password">
-  <input type="checkbox">  <!-- "Remember me", unnamed -->
-  <button type="submit">Sign In</button>
+<form action="https://kagi.com/login" method="post">
+  <input type="hidden" name="_csrf" value="…">
+  <input type="hidden" name="r" value="https://assistant.kagi.com/">  <!-- v2 redirect target -->
+  <input type="text" name="email">
+  <input type="password" name="password">
 </form>
 ```
 
 ### POST /login
 
-```http
-POST /login HTTP/1.1
-Host: kagi.com
-Content-Type: application/x-www-form-urlencoded
-Origin: https://kagi.com
-Referer: https://kagi.com/signin
-Cookie: <whatever GET /signin set>
-
-_csrf=fJxHGYaotOG2P3-_...&r=%2Fassistant&email=user%40example.com&password=...
-```
-
-Form-encoded only. Note the form action is **`/login`**, not `/signin`. The
-`r` field is the post-login redirect target (any sane path; `/` works).
-
-Successful response:
-
-```http
-HTTP/1.1 302 Found
-Location: /assistant
-Set-Cookie: kagi_session=ISAqB7Rs...; Domain=.kagi.com; Path=/; HttpOnly; Secure; SameSite=Lax
-```
-
-Failure modes:
-
-- 200 OK with the sign-in form re-rendered (wrong credentials).
-- 302 Found with `Location: /signin?...` (also rejection).
-- 403 Forbidden (missing the GET-sourced cookies, or CSRF token mismatch).
-
-The Go client uses a `cookiejar.Jar` so the GET → POST chain replays the
-cookies automatically; redirects are disabled (`http.ErrUseLastResponse`)
-so we can read the `Set-Cookie` from the 302 directly.
-
-## 404-as-auth-fail quirk
-
-For unauthenticated `POST /assistant/prompt`, Kagi returns **404 Not Found**
-(not 401/403). The Go client treats 404, 401, 403, and 3xx redirects to
-/signin or /signup all as auth failure and triggers auto-relogin once.
-
-This means a real 404 (e.g. malformed thread id) will also trigger one
-relogin attempt, but the retry will see the same 404 and surface it as the
-final error — no infinite loop.
-
-## Thread list — `POST /assistant/thread_list`
-
-Sidebar pagination. Streamed in the same NUL-delimited Kagi protocol as
-`/assistant/prompt`, but only emits three event types: `hi`, `tags.json`, and
-`thread_list.html`.
-
-Request:
-
-```json
-{
-  "cursor": {
-    "ack": "2025-03-30T13:07:09Z",
-    "created_at": "2025-03-30T13:04:24Z",
-    "id": "0069d9df-fa0d-43c7-bcce-92faf4cc367b"
-  },
-  "limit": 100
-}
-```
-
-Pass `cursor: null` for page 1; pass the previous response's `next_cursor`
-verbatim for subsequent pages. The endpoint refuses to advance without a
-cursor — there is no pure offset/limit form.
-
-`thread_list.html` payload:
-
-```json
-{
-  "html": "<div class=\"hide-if-no-threads\" data-group-name=\"Today\">...</div>...",
-  "next_cursor": {"ack": "...", "created_at": "...", "id": "..."},
-  "has_more": true,
-  "count": 100,
-  "total_counts": null
-}
-```
-
-The `html` field contains server-rendered `<li class="thread">` entries
-grouped by date label (`Today`, `Previous 7 days`, `All time`). Each `<li>`
-exposes its metadata as data attributes:
-
-```html
-<li class="thread"
-    data-code="<thread-uuid>"
-    data-saved="true"
-    data-public="false"
-    data-tags="[]"
-    data-snippet="first ~80 chars of the prompt"
-    >
-  <a href="/assistant/<thread-uuid>">
-    <div class="title">LLM-generated title</div>
-    <div class="excerpt">echo of the snippet</div>
-  </a>
-</li>
-```
-
-`client.parseThreadHTML` extracts these via regex (HTML structure is stable;
-no JSON island for this endpoint).
-
-## Thread detail — `GET /assistant/<thread-uuid>`
-
-The full thread page. The conversation isn't streamed — it's embedded as two
-JSON islands the JS bundle hydrates into `<div id="chat_box">` on load:
-
-```html
-<div id="json-thread" hidden>{...}</div>
-<div id="json-message-list" hidden>[...]</div>
-```
-
-`json-thread` (single object):
-
-```json
-{
-  "id": "8869e6c6-...",
-  "title": "Greeting",
-  "ack": "2026-05-02T08:37:47Z",
-  "created_at": "2026-04-30T18:10:35Z",
-  "saved": true,
-  "shared": false,
-  "branch_id": "00000000-0000-4000-0000-000000000000",
-  "tag_ids": [],
-  "profile": { /* full AssistantProfile snapshot */ }
-}
-```
-
-`json-message-list` (array, oldest first). Each entry represents one **turn**
-(user prompt + assistant reply paired into a single record):
-
-```json
-{
-  "id": "a3fb461b-...",
-  "thread_id": "8869e6c6-...",
-  "created_at": "2026-04-30T18:10:35Z",
-  "branch_list": ["00000000-0000-4000-0000-000000000000"],
-  "state": "done",
-  "prompt": "user input (markdown)",
-  "reply": "<p>assistant output (HTML)</p>",
-  "md": "assistant output (markdown)",
-  "profile": { /* AssistantProfile used for this turn */ },
-  "metadata": "<li>...billing HTML...</li>",
-  "documents": []
-}
-```
-
-The **last entry's `id`** is the value to pass as `focus.message_id` when
-continuing the conversation — this is what made the previous "--parent
-required with -t" CLI restriction obsolete.
-
-The `<div id="chat_box">` itself is empty in the server response; the
-browser populates it from `json-message-list` after page load. Don't bother
-parsing the chat-bubble templates.
-
-## Thread modify — `POST /assistant/thread_modify`
-
-Bulk rename / save / share / re-tag. Streamed protocol, only emits `hi`.
-
-```json
-{
-  "threads": [
-    {
-      "id": "8869e6c6-...",
-      "title": "New Title",
-      "saved": true,
-      "shared": false,
-      "tag_ids": []
-    }
-  ]
-}
-```
-
-Send the **complete current state** for each thread, not a diff — the server
-overwrites every listed field. If `title` is empty the server keeps the
-existing title; everything else is required.
-
-## Thread delete — `POST /assistant/thread_delete`
-
-Same shape as `thread_modify`:
-
-```json
-{
-  "threads": [
-    {"id": "<uuid>", "title": "...", "saved": true, "shared": false, "tag_ids": []}
-  ]
-}
-```
-
-A bare `[{"id":"..."}]` envelope works for some thread states but the JS
-client always sends the full snapshot — so do we (`client.DeleteThreads`
-fetches each thread first to fill in the metadata).
-
-## Thread search — `POST /assistant/search`
-
-Full-text search across the user's threads. Returns a **plain JSON array**
-(not the streamed Kagi protocol), one entry per matching message:
-
-```json
-[
-  {
-    "rank": 0.1,
-    "snippet": "...HTML with <b>matches</b>...",
-    "message_id": "7a11973a-...",
-    "branch_id": "00000000-0000-4000-0000-000000000000",
-    "thread_id": "8962a19b-..."
-  }
-]
-```
-
-Request:
-
-```json
-{"q": "search terms", "tag_id": null, "saved": null, "shared": null}
-```
-
-All filter fields are optional — omitted = no filter. `q` is matched against
-message bodies (not just titles), and the snippet shows the actual hit
-context.
-
-## Custom Assistant CRUD
-
-Driven from `/settings/custom_assistant` (the per-assistant edit page) and
-`/settings/assistant` (the listing page; reuses the embedded
-`json-profile-list` from `/assistant`). Both submission endpoints take
-`application/x-www-form-urlencoded` with **no CSRF token** — cookie auth is
-the only requirement.
-
-### `POST /settings/ast/profiles/update` — create or update
-
-Empty `profile_id` → create. Populated → update. Form fields:
-
-| Field                 | Required | Notes                                                  |
-| --------------------- | -------- | ------------------------------------------------------ |
-| `profile_id`          |          | Empty for create, UUID for update.                     |
-| `name`                | ✓        | Display name (must be unique within an account).        |
-| `base_model`          | ✓        | Model id (see `kagi models`).                           |
-| `custom_instructions` |          | System prompt. Send empty string to clear.              |
-| `bang_trigger`        |          | Optional bang command (e.g. `code` → `!code prompt`).   |
-| `internet_access`     |          | `on` (enabled) or `false` (disabled).                   |
-| `personalizations`    |          | `on` or `false`.                                        |
-| `selected_lens`       |          | Lens id, or `0` for none.                               |
-
-The form on the live page sends the checkbox both as a checkbox (value `on`,
-present only when checked) **and** a hidden fallback (value `false`). We
-collapse this into a single field that's always present with `on`/`false`.
-
-Success: 302 redirect back to `/settings/assistant`. No body, no echo of the
-new id — the client has to look the new profile up by name in the
-post-create profile list.
-
-Failure (validation error): 200 with the form re-rendered in HTML. The Go
-client surfaces this as an error.
-
-### `POST /settings/ast/profiles/delete`
-
-```
-profile_id=<uuid>
-```
-
-302 to `/settings/assistant` on success. Cannot delete the default profile —
-server returns 302 *back* to `/settings/assistant` with an error flash, which
-is HTTP-indistinguishable from the success redirect. The Go client brackets
-the POST with two `FetchProfiles` calls to verify the id existed beforehand
-and is gone afterward, surfacing both "no such id" and "delete rejected" as
-errors instead of silently succeeding.
-
-### `GET /settings/custom_assistant?id=<uuid>` — edit page (read side)
-
-The form's *current* values for an existing assistant. Used by the Go client
-to support partial updates: fetch → mutate the fields the caller cares
-about → POST the whole form back to `/settings/ast/profiles/update`. The
-fields available on the page mirror the create form exactly:
-
-- `<input name="name" value="...">`
-- `<input name="bang_trigger" value="...">`
-- `<textarea name="custom_instructions">...</textarea>` (HTML-entity encoded)
-- `<input name="internet_access" type="checkbox" value=on [checked]>`
-- `<input name="personalizations" type="checkbox" value=on [checked]>`
-- `<input name="base_model" type="radio" value="..." [checked]>` (one per available model)
-- `<input name="selected_lens" type="radio" value="..." [checked]>` (`value="0"` = no lens)
-
-There's no JSON island for this page — it's a plain HTML form. The Go
-client (`parseCustomAssistantForm`) extracts each field by regex.
-
-## File upload — `POST /assistant/prompt` (multipart variant)
-
-Files attach to a regular prompt request via `multipart/form-data` instead
-of the JSON-encoded form. The browser builds the body as:
-
-```
-Content-Type: multipart/form-data; boundary=...
-
---boundary
-Content-Disposition: form-data; name="state"
-Content-Type: application/json
-
-{"focus":{...},"profile":{...},"threads":[...]}
-
---boundary
-Content-Disposition: form-data; name="file"; filename="screenshot.png"
-Content-Type: image/png
-
-<binary>
-
---boundary
-Content-Disposition: form-data; name="__kagithumbnail"; filename="screenshot.png"
-Content-Type: image/jpeg
-
-<binary>  // 84x84 jpeg, only for images
---boundary--
-```
-
-Notes:
-
-- The `state` field carries the same JSON envelope as the unilaterally
-  JSON-encoded request. No new fields — `documents: []` in
-  `new_message.json` will be populated server-side once attachments are
-  processed.
-- Each file is appended as `name="file"` (one entry per file).
-- For images, the browser also generates an 84×84 thumbnail (downscaled to
-  60% JPEG quality) and appends it as `name="__kagithumbnail"`. The server
-  uses this for the upload preview UI. Non-image uploads omit the thumb.
-- Don't set `Content-Type` manually; let the HTTP client set the multipart
-  boundary.
-- `Accept: application/vnd.kagi.stream` and the rest of the streaming
-  response protocol are unchanged.
-
-Not yet wired into the Go client (see `docs/todo.md`).
-
-## Other action endpoints (not exposed in the CLI)
-
-Captured from the JS bundle, listed for completeness:
-
-- `POST /assistant/stop/{trace_id}` — abort an in-flight streaming response.
-  The `trace_id` is the value emitted on the first `new_message.json` of a
-  prompt response.
-- `POST /assistant/message_regenerate` — re-roll an assistant turn (creates a
-  new branch under the same parent).
-- `POST /assistant/message_edit` — rewrite a user message and re-run the
-  thread from that point.
-- `POST /assistant/thread_open` — likely warms a thread; not investigated.
-- `POST /assistant/tags/{create,modify,delete}` — tag CRUD. Bodies:
-  `tags/create: [{name, color, icon_ref}]`, `tags/modify: [{id, name, color,
-  icon_ref}]`, `tags/delete: [<tag-id>]`.
+Form-encoded (`_csrf`, `r`, `email`, `password`); form action is **`/login`**.
+Success → `302 Found` with `Set-Cookie: kagi_session=…; Domain=.kagi.com`.
+Failure → 200 (form re-rendered), 302 to `/signin?…`, or 403 (missing cookies).
+
+The Go client uses a `cookiejar.Jar` so the GET → POST cookie chain replays
+automatically; redirects are disabled (`http.ErrUseLastResponse`) to read the
+`Set-Cookie` off the 302.
+
+## v1 prompt protocol (dead)
+
+`POST /assistant/prompt`, single call, custom NUL-delimited
+`application/vnd.kagi.stream` (`<type>:<payload>\0`), event types `hi`,
+`thread.json`, `tokens.json`, `new_message.json`, etc. Request envelope
+`{focus:{thread_id,branch_id,prompt,message_id}, profile:{id,model,
+internet_access,personalizations,lens_id}, threads:[…]}`. Superseded by the
+three-step v2 flow above. See git history of this file for the full v1 detail.
