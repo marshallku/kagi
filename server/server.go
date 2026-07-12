@@ -71,6 +71,10 @@ type chatRequest struct {
 	Model          string `json:"model,omitempty"`
 	ProfileID      string `json:"profile_id,omitempty"`
 	InternetAccess *bool  `json:"internet_access,omitempty"`
+	// Personalization toggles Kagi's account personalization for this message.
+	// Omitted → on (Kagi's own default). Set false to keep the account's personal
+	// context out of the reply (e.g. a story generator).
+	Personalization *bool `json:"personalization,omitempty"`
 	// Resume continues the most recent thread for this host (the same state
 	// file `kagi chat --resume` reads/writes — $XDG_STATE_HOME/kagi/
 	// last-session.json). Mutually exclusive with thread_id; intended for
@@ -109,7 +113,13 @@ func (s *Server) buildPrompt(req chatRequest) (client.PromptRequest, error) {
 	if req.InternetAccess != nil {
 		internet = *req.InternetAccess
 	}
-	return client.NewPrompt(req.Prompt, req.ThreadID, req.MessageID, profileID, model, internet), nil
+	pr := client.NewPrompt(req.Prompt, req.ThreadID, req.MessageID, profileID, model, internet)
+	// NewPrompt defaults personalization on (Kagi's default); honour an explicit
+	// per-request override so a caller can keep account context out of the reply.
+	if req.Personalization != nil {
+		pr.Profile.Personalizations = *req.Personalization
+	}
+	return pr, nil
 }
 
 // errEmptyThread is the sentinel for "thread exists but has no messages
