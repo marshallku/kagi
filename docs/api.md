@@ -300,6 +300,29 @@ Field notes:
 - `cursor=0-0` requests from the start; the `id` values (`<ms>-<seq>`) are
   resumable cursors for reconnects.
 
+#### One connection is not enough
+
+Because `text`/`html_content` are cumulative snapshots rather than deltas, a
+long turn re-sends the whole answer on every frame — quadratic traffic. A
+measured example: one deep-research turn had pushed **58 MB across 3,201
+frames** while still in its thinking phase, with individual frames reaching
+~100 KB. The edge in front of the API does not tolerate that; the connection is
+reset mid-turn (observed: HTTP/2 `INTERNAL_ERROR` at ~5 minutes).
+
+The generation is **not** tied to the connection:
+
+- it keeps running after the reader disconnects,
+- `GET …/stream/status` reports `{"active": true}` for the whole time,
+- the finished answer is written to the conversation regardless (a turn whose
+  reader died at 5 min was persisted at 11 min and readable via
+  `/api/conversations/{uuid}/init`).
+
+So a client must reconnect with `?cursor=<last event id>` instead of treating
+the drop as a failure — this is what the official web client does (it retries
+`/api/v2/turns/{uuid}/stream` with a cursor and dedups on `event.seq`). A
+cursor resumes *exclusive* of the given id and replays only the current turn.
+Snapshot semantics make a missed frame harmless: any later frame is a superset.
+
 ### Follow-up turns
 
 Post to the same conversation's branch again with the next
@@ -310,7 +333,38 @@ threads the reply onto the prior turn. Resolve the head via
 ### Abort / status
 
 - `POST /api/branches/{branch_uuid}/stream/cancel` — stop an in-flight stream.
-- `GET  /api/branches/{branch_uuid}/stream/status` — poll stream state.
+  Returns `{"status": "not_streaming", "count": 0}` when there was nothing to
+  cancel.
+- `GET  /api/branches/{branch_uuid}/stream/status` — poll stream state:
+  `{"active": bool, "branch_uuid": "…", "user_message_uuid": "…"}`. `active`
+  stays true while the turn is generating, whether or not anyone is reading the
+  stream — it is the signal for "reconnect" vs. "give up". Once the turn is over
+  the uuids come back `null`.
+- `GET …/stream` answers **`204 No Content`** once the turn's stream buffer is
+  gone. That is an empty read, not an error — treat it as "nothing more here"
+  and fall back to the persisted conversation.
+
+## Usage cap — `GET /api/billing/status`
+
+```json
+{"limit": "hard", "reason": "cost", "can_proceed": false,
+ "limit_status": "assistant_limit_hard_cost",
+ "usage": {"interaction_count": 56, "included_cost_usd": 25.96,
+           "included_cost_limit_usd": 25.0, "included_cost_soft_limit_usd": 20.0},
+ "ack": {"soft": false, "hard": false}}
+```
+
+The same `billing` block rides along on the terminal stream frame. This matters
+for stream handling: **a turn that trips the cap mid-generation just stops** —
+no error frame, no `is_final`, nothing persisted — which looks exactly like a
+network failure. Posting a new message once capped fails loudly instead, with
+`402 … (billing_limit_reached)`. When a stream ends with no answer, check this
+endpoint before blaming the transport.
+
+A frame can also carry `is_final: true` **and** `error` together (observed:
+`"Server is shutting down. Please retry your request."`). That is the turn dying
+upstream with nothing saved — retrying the *connection* will not help; the
+message has to be posted again.
 
 ## Conversation detail — `GET /api/conversations/{uuid}/init`
 

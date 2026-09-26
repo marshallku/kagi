@@ -10,7 +10,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strings"
+	"time"
 )
 
 const (
@@ -34,6 +36,22 @@ type Client struct {
 	// OnRefresh, if set, is called with the new session value after a
 	// successful auto-login or explicit Login() call.
 	OnRefresh func(session string)
+
+	// OnReconnect, if set, is called before each SSE reconnect. A long turn
+	// legitimately drops several connections, so callers want to say so rather
+	// than look frozen.
+	OnReconnect func(attempt int, cursor string)
+
+	// apiBase overrides APIBase; only tests set it.
+	apiBase string
+}
+
+// base is the assistant API origin every /api/* call is built against.
+func (c *Client) base() string {
+	if c.apiBase != "" {
+		return c.apiBase
+	}
+	return APIBase
 }
 
 func New(session string) *Client {
@@ -127,7 +145,7 @@ func (c *Client) apiDoRetry(ctx context.Context, method, path string, reqBody, o
 		bodyReader = bytes.NewReader(raw)
 	}
 
-	req, err := c.newRequestURL(ctx, method, APIBase+path, bodyReader)
+	req, err := c.newRequestURL(ctx, method, c.base()+path, bodyReader)
 	if err != nil {
 		return err
 	}
@@ -136,8 +154,8 @@ func (c *Client) apiDoRetry(ctx context.Context, method, path string, reqBody, o
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Cookie", "kagi_session="+c.Session)
-	req.Header.Set("Origin", APIBase)
-	req.Header.Set("Referer", APIBase+"/")
+	req.Header.Set("Origin", c.base())
+	req.Header.Set("Referer", c.base()+"/")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -319,14 +337,15 @@ type messageBody struct {
 }
 
 // startChat runs the first three steps of the v2 flow — resolve/create the
-// conversation + branch and post the user message — returning the branch uuid
-// (which the stream lives under), the conversation uuid, and the SSE stream
-// path. It does NOT read the stream; Send and Stream do that differently.
-func (c *Client) startChat(ctx context.Context, req PromptRequest) (branchUUID, convUUID, streamURL string, err error) {
+// conversation + branch and post the user message — returning everything the
+// reader needs to pick the reply up. It does NOT read the stream; Send and
+// Stream do that differently.
+func (c *Client) startChat(ctx context.Context, req PromptRequest) (turn chatTurn, err error) {
 	model := req.Profile.Model
 	profileUUID := req.Profile.ID
+	branchUUID := ""
 
-	convUUID = ""
+	convUUID := ""
 	if req.Focus.ThreadID != nil {
 		convUUID = *req.Focus.ThreadID
 	}
@@ -339,12 +358,12 @@ func (c *Client) startChat(ctx context.Context, req PromptRequest) (branchUUID, 
 		if createModel == "" && profileUUID != "" {
 			ca, lerr := c.findAssistant(ctx, profileUUID)
 			if lerr != nil {
-				return "", "", "", fmt.Errorf("resolve assistant model: %w", lerr)
+				return turn, fmt.Errorf("resolve assistant model: %w", lerr)
 			}
 			createModel = ca.LLMID
 		}
 		if createModel == "" {
-			return "", "", "", errors.New("chat: model or profile required")
+			return turn, errors.New("chat: model or profile required")
 		}
 		var created struct {
 			Conversation  Conversation `json:"conversation"`
@@ -352,7 +371,7 @@ func (c *Client) startChat(ctx context.Context, req PromptRequest) (branchUUID, 
 		}
 		if err = c.apiDo(ctx, http.MethodPost, "/api/conversations",
 			map[string]string{"model_name": createModel}, &created); err != nil {
-			return "", "", "", fmt.Errorf("create conversation: %w", err)
+			return turn, fmt.Errorf("create conversation: %w", err)
 		}
 		convUUID = created.Conversation.UUID
 		branchUUID = created.DefaultBranch.UUID
@@ -360,14 +379,14 @@ func (c *Client) startChat(ctx context.Context, req PromptRequest) (branchUUID, 
 		// Existing conversation: post onto its active branch.
 		var init conversationInit
 		if err = c.apiDo(ctx, http.MethodGet, "/api/conversations/"+convUUID+"/init", nil, &init); err != nil {
-			return "", "", "", fmt.Errorf("load conversation: %w", err)
+			return turn, fmt.Errorf("load conversation: %w", err)
 		}
 		branchUUID = init.ActiveBranch.UUID
 		if branchUUID == "" && len(init.Branches) > 0 {
 			branchUUID = init.Branches[0].UUID
 		}
 		if branchUUID == "" {
-			return "", "", "", fmt.Errorf("conversation %s: no branch to post to", convUUID)
+			return turn, fmt.Errorf("conversation %s: no branch to post to", convUUID)
 		}
 	}
 
@@ -388,18 +407,45 @@ func (c *Client) startChat(ctx context.Context, req PromptRequest) (branchUUID, 
 
 	var posted struct {
 		StreamURL string `json:"stream_url"`
+		Branch    struct {
+			UUID string `json:"uuid"`
+		} `json:"branch"`
+		UserMessage struct {
+			UUID string `json:"uuid"`
+		} `json:"user_message"`
 	}
 	if err = c.apiDo(ctx, http.MethodPost, "/api/branches/"+branchUUID+"/messages", body, &posted); err != nil {
 		if errors.Is(err, ErrNotFound) && profileUUID != "" {
-			return "", "", "", fmt.Errorf("post message: profile %q not found — it may be a stale v1 profile id; pick one from `kagi profiles` or run `kagi config set profile <uuid>`", profileUUID)
+			return turn, fmt.Errorf("post message: profile %q not found — it may be a stale v1 profile id; pick one from `kagi profiles` or run `kagi config set profile <uuid>`", profileUUID)
 		}
-		return "", "", "", fmt.Errorf("post message: %w", err)
+		return turn, fmt.Errorf("post message: %w", err)
 	}
-	streamURL = posted.StreamURL
+	// Posting can fork a branch, in which case the reply streams from the
+	// branch in the *response*, not the one we posted to. Resolve that first:
+	// both the fallback stream URL and status polling must name the same
+	// branch, or we would watch a turn nobody is waiting for.
+	if posted.Branch.UUID != "" {
+		branchUUID = posted.Branch.UUID
+	}
+	streamURL := posted.StreamURL
 	if streamURL == "" {
 		streamURL = "/api/branches/" + branchUUID + "/stream"
 	}
-	return branchUUID, convUUID, streamURL, nil
+	return chatTurn{
+		branchUUID:  branchUUID,
+		convUUID:    convUUID,
+		streamURL:   streamURL,
+		userMsgUUID: posted.UserMessage.UUID,
+	}, nil
+}
+
+// chatTurn is what startChat resolved: where the reply will stream from, and
+// the user message it answers.
+type chatTurn struct {
+	branchUUID  string
+	convUUID    string
+	streamURL   string
+	userMsgUUID string
 }
 
 // sseEvent is the JSON payload of each `data:` line in the response stream.
@@ -415,49 +461,65 @@ type sseEvent struct {
 	Error              string `json:"error"`
 }
 
+// Stream constants. A single SSE connection to the assistant API does not
+// survive a long turn: every frame re-sends the whole cumulative reply, so a
+// deep-research answer pushes hundreds of megabytes through the connection and
+// the edge proxy resets it (observed: HTTP/2 INTERNAL_ERROR at ~5 minutes).
+// The generation itself keeps running server-side and is persisted when it
+// finishes, so the fix is to reconnect from the last event id rather than to
+// give up — which is what the official web client does too.
+const (
+	// streamMaxStalls bounds *consecutive* reconnects that yield no new
+	// frames. A healthy long turn always makes progress, so this only trips
+	// when the stream is genuinely over or wedged.
+	streamMaxStalls = 5
+	// streamRetryDelay is the pause before each reconnect attempt.
+	streamRetryDelay = 2 * time.Second
+	// streamRecoverTries is how many times the persisted-answer fallback
+	// re-reads the conversation before giving up.
+	streamRecoverTries = 3
+)
+
+// sseState is the cursor and cumulative reply carried across reconnects. The
+// v2 frames are snapshots rather than deltas, so resuming only needs the last
+// event id; the cumulative fields exist because the terminal frame carries
+// only `text` and we still owe the caller an `html_content`.
+type sseState struct {
+	cursor    string // last event id seen; "0-0" means "from the start"
+	final     bool   // a terminal new_message.json was emitted
+	sawDone   bool   // the [DONE] sentinel was seen — nothing more will arrive
+	frames    int    // total frames flushed, used to detect progress
+	titleSent string
+	lastText  string
+	lastHTML  string
+}
+
 // Stream runs a chat turn and emits events. For compatibility with the v1
 // consumers (client.Send, the HTTP server's snoop+relay), the events are
 // emitted under the v1 type names — `thread.json`, `tokens.json`, and a
 // terminal `new_message.json` carrying state="done" — synthesised from the v2
 // SSE stream.
 func (c *Client) Stream(ctx context.Context, req PromptRequest) (<-chan Event, <-chan error, error) {
-	branchUUID, convUUID, streamURL, err := c.startChat(ctx, req)
+	turn, err := c.startChat(ctx, req)
 	if err != nil {
 		return nil, nil, err
 	}
-	_ = branchUUID
 
-	httpReq, err := c.newRequestURL(ctx, http.MethodGet, APIBase+streamURL+"?cursor=0-0", nil)
+	// The first connection is opened synchronously so that a hard failure
+	// (auth, 4xx) is reported to the caller instead of arriving late on the
+	// error channel.
+	resp, err := c.openStream(ctx, turn.streamURL, "0-0")
 	if err != nil {
 		return nil, nil, err
-	}
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cookie", "kagi_session="+c.Session)
-	httpReq.Header.Set("Origin", APIBase)
-	httpReq.Header.Set("Referer", APIBase+"/")
-
-	resp, err := c.HTTP.Do(httpReq)
-	if err != nil {
-		return nil, nil, fmt.Errorf("open stream: %w", err)
-	}
-	if isAuthFail(resp) {
-		resp.Body.Close()
-		return nil, nil, fmt.Errorf("auth failed (status %d) opening stream", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, nil, fmt.Errorf("stream %s", apiErrorMessage(raw, resp.StatusCode))
 	}
 
 	events := make(chan Event, 16)
 	errs := make(chan error, 1)
 
 	go func() {
-		defer resp.Body.Close()
 		defer close(events)
 		defer close(errs)
-		if err := relaySSE(resp.Body, convUUID, events); err != nil && !errors.Is(err, io.EOF) {
+		if err := c.pumpStream(ctx, resp, turn, events); err != nil {
 			errs <- err
 		}
 	}()
@@ -465,17 +527,274 @@ func (c *Client) Stream(ctx context.Context, req PromptRequest) (<-chan Event, <
 	return events, errs, nil
 }
 
+// openStream opens one SSE connection to the branch stream at the given
+// cursor. The caller owns the returned body.
+func (c *Client) openStream(ctx context.Context, streamURL, cursor string) (*http.Response, error) {
+	sep := "?"
+	if strings.Contains(streamURL, "?") {
+		sep = "&"
+	}
+	req, err := c.newRequestURL(ctx, http.MethodGet, c.base()+streamURL+sep+"cursor="+url.QueryEscape(cursor), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cookie", "kagi_session="+c.Session)
+	req.Header.Set("Origin", c.base())
+	req.Header.Set("Referer", c.base()+"/")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("open stream: %w", err)
+	}
+	if isAuthFail(resp) {
+		resp.Body.Close()
+		return nil, fmt.Errorf("auth failed (status %d) opening stream", resp.StatusCode)
+	}
+	// 204 means the turn's stream no longer exists (it ended, or its buffer
+	// was reclaimed). That is an empty read, not a failure: the reader sees
+	// EOF, the stall path checks the turn status, and recovery takes over.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("stream %s", apiErrorMessage(raw, resp.StatusCode))
+	}
+	return resp, nil
+}
+
+// pumpStream drains the SSE stream to completion, reconnecting from the last
+// event id whenever the connection drops before the terminal frame. It takes
+// ownership of resp.
+func (c *Client) pumpStream(ctx context.Context, resp *http.Response, turn chatTurn, out chan<- Event) error {
+	st := &sseState{cursor: "0-0"}
+	stalls, reconnects := 0, 0
+	var lastErr error
+
+	for {
+		if resp != nil {
+			before := st.frames
+			lastErr = relaySSE(ctx, resp.Body, turn.convUUID, out, st)
+			resp.Body.Close()
+			resp = nil
+
+			if st.final {
+				return nil
+			}
+			// A frame carrying an explicit error is upstream's verdict on the
+			// turn, not a transport hiccup — reconnecting would just replay it.
+			var ue *upstreamError
+			if errors.As(lastErr, &ue) {
+				return lastErr
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			if st.frames > before {
+				stalls = 0
+			} else {
+				stalls++
+			}
+			// The sentinel means the stream is closed for good. Reconnecting
+			// would only re-read it, so go straight to what was persisted —
+			// we get here when the terminal frame itself was lost.
+			if st.sawDone {
+				return c.recoverPersisted(ctx, turn, out, st, lastErr)
+			}
+		}
+
+		// Two fruitless attempts in a row with the turn no longer running:
+		// nothing more will arrive on the wire. One is not enough — generation
+		// can go quiet between chunks and finish right after the status check,
+		// leaving the terminal frame still unread.
+		if stalls >= 2 {
+			if active, serr := c.streamActive(ctx, turn.branchUUID); serr == nil && !active {
+				return c.recoverPersisted(ctx, turn, out, st, lastErr)
+			}
+		}
+		if stalls >= streamMaxStalls {
+			return c.recoverPersisted(ctx, turn, out, st, lastErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(streamRetryDelay):
+		}
+
+		reconnects++
+		if c.OnReconnect != nil {
+			c.OnReconnect(reconnects, st.cursor)
+		}
+		next, err := c.openStream(ctx, turn.streamURL, st.cursor)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// A failed reopen is just another stall. Spending the budget here
+			// keeps a transient outage from costing the answer, since the
+			// recovery path is still ahead.
+			lastErr = err
+			stalls++
+			continue
+		}
+		resp = next
+	}
+}
+
+// streamStatus is GET /api/branches/{uuid}/stream/status — whether a turn is
+// still being generated on that branch.
+type streamStatus struct {
+	Active bool `json:"active"`
+}
+
+func (c *Client) streamActive(ctx context.Context, branchUUID string) (bool, error) {
+	var st streamStatus
+	if err := c.apiDo(ctx, http.MethodGet, "/api/branches/"+branchUUID+"/stream/status", nil, &st); err != nil {
+		return false, err
+	}
+	return st.Active, nil
+}
+
+// recoverPersisted is the last resort when the stream stopped without a
+// terminal frame. The generation outlives the connection and is written to the
+// conversation when it finishes, so a completed answer is often already
+// readable even though we never saw `is_final`.
+func (c *Client) recoverPersisted(ctx context.Context, turn chatTurn, out chan<- Event, st *sseState, cause error) error {
+	if turn.convUUID == "" || turn.userMsgUUID == "" {
+		return c.giveUp(ctx, turn.convUUID, cause)
+	}
+	// The write can trail the stream going idle by a beat, so give it a few
+	// tries before declaring the answer lost.
+	var m Message
+	for attempt := 0; ; attempt++ {
+		var init conversationInit
+		if err := c.apiDo(ctx, http.MethodGet, "/api/conversations/"+turn.convUUID+"/init", nil, &init); err == nil {
+			// Only accept a reply to *this* turn — the previous turn's answer
+			// is still sitting in the same conversation.
+			if got, ok := replyTo(init.Messages.Items, turn.userMsgUUID); ok {
+				m = got
+				break
+			}
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt >= streamRecoverTries-1 {
+			return c.giveUp(ctx, turn.convUUID, cause)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(streamRetryDelay):
+		}
+	}
+	// Emit the recovered text as a token frame first: `kagi chat --stream`
+	// prints only tokens, so without this the terminal event would carry an
+	// answer the user never sees.
+	if m.Content != st.lastText {
+		tok, _ := json.Marshal(map[string]string{"text": m.Content, "id": m.UUID})
+		if err := sendEvent(ctx, out, Event{Type: "tokens.json", Data: tok}); err != nil {
+			return err
+		}
+		st.lastText = m.Content
+	}
+	done, _ := json.Marshal(map[string]any{
+		"id":        m.UUID,
+		"thread_id": turn.convUUID,
+		"state":     "done",
+		"reply":     m.HTMLContent,
+		"md":        m.Content,
+	})
+	if err := sendEvent(ctx, out, Event{Type: "new_message.json", Data: done}); err != nil {
+		return err
+	}
+	st.final = true
+	return nil
+}
+
+// replyTo finds the assistant message answering userMsgUUID.
+func replyTo(items []Message, userMsgUUID string) (Message, bool) {
+	for _, m := range items {
+		if m.Role == "assistant" && m.ParentMessageUUID == userMsgUUID && m.Content != "" {
+			return m, true
+		}
+	}
+	return Message{}, false
+}
+
+// billingStatus is GET /api/billing/status.
+type billingStatus struct {
+	CanProceed bool   `json:"can_proceed"`
+	Limit      string `json:"limit"`
+	Reason     string `json:"reason"`
+}
+
+// billingBlock explains a usage cap when that is why a turn stopped producing
+// output, and returns "" otherwise. Hitting the cap mid-generation kills the
+// turn silently, which is indistinguishable from a network failure unless we
+// go and ask.
+func (c *Client) billingBlock(ctx context.Context) string {
+	var b billingStatus
+	if err := c.apiDo(ctx, http.MethodGet, "/api/billing/status", nil, &b); err != nil || b.CanProceed {
+		return ""
+	}
+	return fmt.Sprintf("the account's usage cap is reached (limit=%q, reason=%q), which cuts a turn off mid-generation", b.Limit, b.Reason)
+}
+
+// giveUp builds the terminal error, asking why the turn stopped first. The
+// lookup can itself be cancelled, which the caller should see as cancellation
+// rather than as a lost answer.
+func (c *Client) giveUp(ctx context.Context, convUUID string, cause error) error {
+	note := c.billingBlock(ctx)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return prematureEnd(convUUID, note, cause)
+}
+
+func prematureEnd(convUUID, note string, cause error) error {
+	msg := "the reply stream ended without an answer"
+	if note != "" {
+		msg += " — " + note
+	}
+	if convUUID != "" {
+		msg += fmt.Sprintf("; the turn may still finish server-side — re-check with `kagi threads show %s`", convUUID)
+	}
+	if cause != nil && !errors.Is(cause, io.EOF) {
+		return fmt.Errorf("%s (last error: %w)", msg, cause)
+	}
+	return errors.New(msg)
+}
+
+// sendEvent delivers one event, giving up if the consumer is gone. A plain
+// channel send would block forever on a full buffer once the caller cancels
+// and stops draining, leaking the stream goroutine and never closing either
+// channel.
+func sendEvent(ctx context.Context, out chan<- Event, ev Event) error {
+	select {
+	case out <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// upstreamError marks an error the server reported inside a frame, as opposed
+// to a transport failure. Only the latter is worth reconnecting for.
+type upstreamError struct{ msg string }
+
+func (e *upstreamError) Error() string { return e.msg }
+
 // relaySSE reads the v2 Server-Sent Events stream and translates each into the
 // v1-style events the existing consumers expect. `text` is cumulative, so we
-// forward it as the `tokens.json.text` field on every update.
-func relaySSE(r io.Reader, convUUID string, out chan<- Event) error {
+// forward it as the `tokens.json.text` field on every update. State that has
+// to survive a reconnect (cursor, cumulative text, whether the title was
+// already emitted) lives in st.
+func relaySSE(ctx context.Context, r io.Reader, convUUID string, out chan<- Event, st *sseState) error {
 	br := bufio.NewReader(r)
 	var dataBuf bytes.Buffer
-	titleSent := ""
-	// `text` and `html_content` are cumulative but arrive on different frames —
-	// the terminal frame typically carries only `text`. Track the latest
-	// non-empty value of each so the final new_message has both populated.
-	lastText, lastHTML := "", ""
+	pendingID := ""
 
 	flush := func() error {
 		if dataBuf.Len() == 0 {
@@ -483,46 +802,65 @@ func relaySSE(r io.Reader, convUUID string, out chan<- Event) error {
 		}
 		payload := dataBuf.String()
 		dataBuf.Reset()
+		eventID := pendingID
+		pendingID = ""
 		if strings.TrimSpace(payload) == "[DONE]" {
+			st.sawDone = true
 			return io.EOF
 		}
 		var ev sseEvent
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 			return nil // ignore non-JSON keepalive frames
 		}
+		// Only advance the cursor once the frame has been understood, so a
+		// reconnect never skips past a frame we failed to process.
+		if eventID != "" {
+			st.cursor = eventID
+		}
+		st.frames++
 		if ev.Error != "" {
-			return errors.New(ev.Error)
+			return &upstreamError{msg: ev.Error}
 		}
 		cid := ev.ConversationUUID
 		if cid == "" {
 			cid = convUUID
 		}
 		// Title (emitted once, usually on the first frame).
-		if ev.ConversationTitle != "" && ev.ConversationTitle != titleSent {
-			titleSent = ev.ConversationTitle
+		if ev.ConversationTitle != "" && ev.ConversationTitle != st.titleSent {
+			st.titleSent = ev.ConversationTitle
 			b, _ := json.Marshal(map[string]string{"id": cid, "title": ev.ConversationTitle})
-			out <- Event{Type: "thread.json", Data: b}
+			if err := sendEvent(ctx, out, Event{Type: "thread.json", Data: b}); err != nil {
+				return err
+			}
 		}
 		if ev.Text != "" {
-			lastText = ev.Text
+			st.lastText = ev.Text
 		}
 		if ev.HTMLContent != "" {
-			lastHTML = ev.HTMLContent
+			st.lastHTML = ev.HTMLContent
 		}
 		// Incremental tokens (text is cumulative).
 		tok, _ := json.Marshal(map[string]string{"text": ev.Text, "id": ev.AssistantMessageID})
-		out <- Event{Type: "tokens.json", Data: tok}
+		if err := sendEvent(ctx, out, Event{Type: "tokens.json", Data: tok}); err != nil {
+			return err
+		}
 		// Terminal frame: the final SSE frame usually carries only `text`, so
 		// fall back to the last seen cumulative values for both fields.
-		if ev.IsFinal {
+		if ev.IsFinal && !st.final {
 			done, _ := json.Marshal(map[string]any{
 				"id":        ev.AssistantMessageID,
 				"thread_id": cid,
 				"state":     "done",
-				"reply":     lastHTML,
-				"md":        lastText,
+				"reply":     st.lastHTML,
+				"md":        st.lastText,
 			})
-			out <- Event{Type: "new_message.json", Data: done}
+			if err := sendEvent(ctx, out, Event{Type: "new_message.json", Data: done}); err != nil {
+				return err
+			}
+			st.final = true
+			// The turn is answered. Stop reading rather than wait out a
+			// connection the server may hold open past the terminal frame.
+			return io.EOF
 		}
 		return nil
 	}
@@ -543,8 +881,10 @@ func relaySSE(r io.Reader, convUUID string, out chan<- Event) error {
 				dataBuf.WriteByte('\n')
 			}
 			dataBuf.WriteString(d)
-		case strings.HasPrefix(trimmed, "id:"), strings.HasPrefix(trimmed, ":"), strings.HasPrefix(trimmed, "event:"):
-			// id / comment / event-name lines: ignored.
+		case strings.HasPrefix(trimmed, "id:"):
+			pendingID = strings.TrimSpace(strings.TrimPrefix(trimmed, "id:"))
+		case strings.HasPrefix(trimmed, ":"), strings.HasPrefix(trimmed, "event:"):
+			// comment / event-name lines: ignored.
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -590,6 +930,11 @@ func (c *Client) Send(ctx context.Context, req PromptRequest, onToken func(text 
 			if json.Unmarshal(ev.Data, &tok) == nil {
 				if tok.ID != "" {
 					res.MessageID = tok.ID
+				}
+				// Keep the cumulative text as we go: if the turn dies, the
+				// caller should still get the part that did arrive.
+				if tok.Text != "" {
+					res.Markdown = tok.Text
 				}
 				if onToken != nil {
 					onToken(tok.Text)

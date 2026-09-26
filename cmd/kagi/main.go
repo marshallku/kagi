@@ -180,6 +180,11 @@ func chatCmd(args []string) {
 	defer cancel()
 
 	c := newAuthedClient(resolveSession())
+	// A long turn outlives a single SSE connection; say so instead of looking
+	// frozen while the client reattaches.
+	c.OnReconnect = func(attempt int, cursor string) {
+		fmt.Fprintf(os.Stderr, "[stream dropped, reattaching (attempt %d, cursor %s)]\n", attempt, cursor)
+	}
 
 	// Auto-resolve --parent when -t is set without it. This used to be a hard
 	// failure; now that we can fetch /assistant/<id>, we look up the last
@@ -213,6 +218,22 @@ func chatCmd(args []string) {
 
 	res, err := c.Send(ctx, req, onToken)
 	if err != nil {
+		// A turn can die after streaming part of its answer. Hand over what did
+		// arrive rather than throwing it away with the error — in the output
+		// format the caller asked for, so `--json` stays machine-readable.
+		if res != nil {
+			switch {
+			case *asJSON:
+				_ = json.NewEncoder(os.Stdout).Encode(res)
+			case *stream:
+				// The partial already went to stdout as it streamed.
+			case res.Markdown != "":
+				fmt.Println(res.Markdown)
+			}
+			if res.ThreadID != "" {
+				fmt.Fprintf(os.Stderr, "[thread=%s]\n", res.ThreadID)
+			}
+		}
 		die(err.Error())
 	}
 
