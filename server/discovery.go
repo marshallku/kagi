@@ -63,6 +63,24 @@ func (s *Server) handleProfilesList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// GET /assistants  is an alias for the profile list. Convention: the CLI uses
-// "profiles" and "assistants" interchangeably for the same data; the HTTP API
-// exposes both spellings so callers don't have to guess.
+// GET /assistants  → every custom assistant, including retired and deprecated
+// ones. Unlike /profiles (a picker list), this is the management view that
+// pairs with POST/PATCH/DELETE /assistants: a caller syncing assistants by name
+// must see the ones Kagi retired with their base model, or it tries to
+// re-create them and hits a name conflict instead of patching in a live model.
+func (s *Server) handleAssistantsList(w http.ResponseWriter, r *http.Request) {
+	profiles, err := s.newClient().FetchProfiles(r.Context())
+	if err != nil {
+		httpClientError(w, err)
+		return
+	}
+	out := profiles[:0]
+	for _, p := range profiles {
+		if p.ID == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	writeJSON(w, http.StatusOK, out)
+}

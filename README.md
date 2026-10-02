@@ -48,7 +48,7 @@ curl -s -X POST localhost:8921/chat \
 #             DELETE /threads/{id}
 #             POST   /threads/delete      # body: {ids:[...]}
 #             POST   /threads/search      # body: {q, tag_id?, saved?, shared?}
-# assistants: GET    /assistants          # alias of /profiles
+# assistants: GET    /assistants          # all custom assistants, incl. retired
 #             GET    /assistants/{id}
 #             POST   /assistants          # body: {name, base_model, instructions?, ...}
 #             PATCH  /assistants/{id}     # partial update; preserves untouched fields

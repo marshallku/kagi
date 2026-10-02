@@ -388,7 +388,7 @@ func (s *Server) Routes() http.Handler {
 	// Discovery (read-only)
 	mux.HandleFunc("GET /models", s.handleModelsList)
 	mux.HandleFunc("GET /profiles", s.handleProfilesList)
-	mux.HandleFunc("GET /assistants", s.handleProfilesList) // alias of /profiles
+	mux.HandleFunc("GET /assistants", s.handleAssistantsList)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
