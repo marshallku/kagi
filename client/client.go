@@ -42,8 +42,10 @@ type Client struct {
 	// than look frozen.
 	OnReconnect func(attempt int, cursor string)
 
-	// apiBase overrides APIBase; only tests set it.
-	apiBase string
+	// apiBase overrides APIBase and authBase overrides BaseURL; only tests
+	// set them.
+	apiBase  string
+	authBase string
 }
 
 // base is the assistant API origin every /api/* call is built against.
@@ -73,11 +75,6 @@ func New(session string) *Client {
 func (c *Client) SetCredentials(email, password string) {
 	c.Email = email
 	c.Password = password
-}
-
-// newRequest builds a request against the kagi.com origin (sign-in flow).
-func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	return c.newRequestURL(ctx, method, BaseURL+path, body)
 }
 
 // newRequestURL builds an HTTP request with the spoofed User-Agent always set,

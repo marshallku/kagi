@@ -49,20 +49,33 @@ The `/api/*` endpoints take the cookie only — **no CSRF token** on JSON calls
 Unauthenticated requests to `/api/init` return **401** (clean, unlike the old
 404-as-auth-fail quirk).
 
-### Sign-in flow
+### Sign-in flow (Zitadel OIDC, captured 2026-10-02)
 
-Unchanged from v1, except the "Login with Kagi" button on
-`assistant.kagi.com/` redirects to:
+Kagi moved sign-in to a Zitadel OIDC login hosted at `account.kagi.com` (a
+SvelteKit app). The old `_csrf` form at `kagi.com/signin` + `POST /login` is
+gone; `GET /signin` now 302s into the OIDC chain. Implemented in
+`client/auth.go`.
 
-```
-https://kagi.com/signin?r=https%3A%2F%2Fassistant.kagi.com%2F
-```
+1. `GET https://kagi.com/signin` → 302 `/oauth2?service=zitadel&` → 302
+   `https://account.kagi.com/oauth/v2/authorize?…` → 302
+   `/loginname?requestId=oidc_V2_…` (200, email form). **The authorize
+   `Location` carries raw spaces in `scope`** — percent-encode them before
+   following or the server answers 400.
+2. `POST /loginname?/email&requestId=…` with `requestId`, `loginName`.
+   With `Accept: application/json` the SvelteKit action answers 200
+   `{"type":"redirect","status":303,"location":"/loginname?sessionId=…&requestId=…"}`.
+3. `GET` that location → password form (hidden `sessionId`, `requestId`,
+   `rememberMeShown`).
+4. `POST /loginname?/password&requestId=…` with the hidden inputs plus
+   `loginName`, `password`, `rememberMe=on` → `{"type":"redirect",
+   "location":"https://kagi.com/oauth2/callback?code=…&state=…"}`. A wrong
+   password comes back as `{"type":"failure",…}`.
+5. `GET` the callback → 302 `/` with `Set-Cookie: kagi_session=…;
+   Domain=.kagi.com`, which authenticates `assistant.kagi.com`.
 
-The sign-in form is identical (`_csrf`, `r`, `email`, `password` fields;
-form action `POST /login`; 302 `Set-Cookie: kagi_session=…` on success). After
-login, `kagi.com` redirects back to `assistant.kagi.com/` and the shared
-cookie authenticates the SPA. See "Sign-in flow" under Legacy below — the
-mechanics are the same; only the `r` redirect target changed.
+The cookie jar must carry `__Host-zitadel.useragent`, `sessions`, etc. across
+hops. No captcha or MFA on a password-only account as of capture; an account
+with MFA/passkeys would not reach a password form and fails loudly.
 
 ## Error envelope
 
@@ -550,10 +563,10 @@ should be captured live before implementation.
 
 > Retained for historical reference and for the migration mapping. These
 > endpoints no longer function for chat (`POST /assistant/prompt` → 500) and
-> the `/assistant` UI redirects to `assistant.kagi.com`. The **auth / sign-in
-> flow below is still accurate** and shared with v2.
+> the `/assistant` UI redirects to `assistant.kagi.com`. The sign-in flow below
+> was replaced by Zitadel OIDC — see "Sign-in flow" above.
 
-## Sign-in flow (captured 2026-04-28, still valid)
+## Sign-in flow (captured 2026-04-28, dead since 2026-10)
 
 Two-step: GET the form to capture CSRF + paired session cookie, then POST.
 
