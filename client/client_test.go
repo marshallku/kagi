@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,184 +14,269 @@ import (
 	"time"
 )
 
-// collectSSE runs relaySSE over the given raw stream and returns the events it
-// emitted plus the terminal error.
-func collectSSE(t *testing.T, raw, convUUID string) ([]Event, error) {
+// testTurn is the chatTurn the stream tests read.
+var testTurn = chatTurn{
+	convUUID:   "conv1",
+	branchUUID: "b1",
+	turnUUID:   "t1",
+	streamURL:  "/api/v2/turns/t1/stream",
+}
+
+// frame renders one SSE frame. An empty id omits the id line.
+func frame(id, data string) string {
+	if id == "" {
+		return "data: " + data + "\n\n"
+	}
+	return "id: " + id + "\ndata: " + data + "\n\n"
+}
+
+// ev renders one turn-event frame of turn t1.
+func ev(id string, seq int, typ, node, parent, payload string) string {
+	return evOf(id, "t1", seq, typ, node, parent, payload)
+}
+
+// evOf is ev for an arbitrary turn id.
+func evOf(id, turnID string, seq int, typ, node, parent, payload string) string {
+	e := fmt.Sprintf(`{"seq":%d,"turn_id":%q,"type":%q`, seq, turnID, typ)
+	if node != "" {
+		e += fmt.Sprintf(`,"node_id":%q`, node)
+	}
+	if parent != "" {
+		e += fmt.Sprintf(`,"parent_node_id":%q`, parent)
+	}
+	if payload == "" {
+		payload = "{}"
+	}
+	e += `,"payload":` + payload + `}`
+	return frame(id, `{"event":`+e+`}`)
+}
+
+// answerStream is a complete turn whose answer is "Four", streamed as deltas.
+func answerStream() string {
+	return ev("1-0", 1, "turn.started", "", "", `{"root_node_id":"r1"}`) +
+		ev("2-0", 2, "node.created", "r1", "", `{"kind":"assistant_message","status":"running"}`) +
+		frame("3-0", `{"title":"My Title"}`) +
+		ev("4-0", 3, "node.created", "n1", "r1", `{"kind":"text","format":"markdown","status":"running"}`) +
+		ev("5-0", 4, "node.delta", "n1", "r1", `{"delta":"Fo"}`) +
+		ev("6-0", 5, "node.delta", "n1", "r1", `{"delta":"ur"}`) +
+		ev("7-0", 6, "node.completed", "n1", "r1", `{"status":"completed","content":"Four"}`) +
+		ev("8-0", 7, "turn.completed", "", "", `{"root_node_id":"r1"}`) +
+		frame("9-0", `{"is_final":true}`)
+}
+
+// collectSSE runs relaySSE over raw with a fresh state.
+func collectSSE(t *testing.T, raw string) ([]Event, error, *sseState) {
 	t.Helper()
-	evs, err, _ := collectSSEState(t, raw, convUUID, &sseState{cursor: "0-0"})
-	return evs, err
+	return collectSSEState(t, raw, newSSEState())
 }
 
 // collectSSEState is collectSSE with an explicit carry-over state, so tests can
 // drive the reconnect path across two partial streams.
-func collectSSEState(t *testing.T, raw, convUUID string, st *sseState) ([]Event, error, *sseState) {
+func collectSSEState(t *testing.T, raw string, st *sseState) ([]Event, error, *sseState) {
 	t.Helper()
 	out := make(chan Event, 256)
 	var err error
 	done := make(chan struct{})
 	go func() {
-		err = relaySSE(context.Background(), strings.NewReader(raw), convUUID, out, st)
+		err = relaySSE(context.Background(), strings.NewReader(raw), testTurn, out, st)
 		close(out)
 		close(done)
 	}()
 	var evs []Event
-	for ev := range out {
-		evs = append(evs, ev)
+	for e := range out {
+		evs = append(evs, e)
 	}
 	<-done
 	return evs, err, st
 }
 
-func TestRelaySSE_NormalStream(t *testing.T) {
-	// A representative v2 stream: title frame, an incremental frame, a final
-	// frame with is_final, then the [DONE] sentinel.
-	raw := strings.Join([]string{
-		`id: 1-0`,
-		`data: {"text":"","conversation_uuid":"conv1","branch_uuid":"b1","is_final":false,"conversation_title":"My Title"}`,
-		``,
-		`id: 2-0`,
-		`data: {"text":"Fo","conversation_uuid":"conv1","is_final":false,"html_content":"<p>Fo</p>"}`,
-		``,
-		`id: 3-0`,
-		`data: {"text":"Four","conversation_uuid":"conv1","is_final":true,"html_content":"<p>Four</p>","assistant_message_uuid":"asst1"}`,
-		``,
-		`data: [DONE]`,
-		``,
-		``,
-	}, "\n")
+// tokenTexts returns the text of every tokens.json event.
+func tokenTexts(evs []Event) []string {
+	var texts []string
+	for _, e := range evs {
+		if e.Type == "tokens.json" {
+			var m struct{ Text string }
+			_ = json.Unmarshal(e.Data, &m)
+			texts = append(texts, m.Text)
+		}
+	}
+	return texts
+}
 
-	evs, err := collectSSE(t, raw, "conv1")
+// doneEvent is the decoded terminal new_message.json.
+type doneEvent struct {
+	ID       string `json:"id"`
+	ThreadID string `json:"thread_id"`
+	State    string `json:"state"`
+	Reply    string `json:"reply"`
+	MD       string `json:"md"`
+}
+
+// finals returns every terminal event emitted.
+func finals(evs []Event) []doneEvent {
+	var out []doneEvent
+	for _, e := range evs {
+		if e.Type == "new_message.json" {
+			var m doneEvent
+			_ = json.Unmarshal(e.Data, &m)
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func TestRelaySSE_NormalStream(t *testing.T) {
+	evs, err, st := collectSSE(t, answerStream())
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected io.EOF terminal, got %v", err)
 	}
+	if !st.ended {
+		t.Error("state not marked ended after turn.completed + is_final")
+	}
 
-	var gotTitle, gotDone bool
-	var lastText, finalMD, finalReply string
-	var tokenCount int
-	for _, ev := range evs {
-		switch ev.Type {
-		case "thread.json":
+	var titles int
+	for _, e := range evs {
+		if e.Type == "thread.json" {
 			var m struct{ ID, Title string }
-			if err := json.Unmarshal(ev.Data, &m); err != nil {
+			if err := json.Unmarshal(e.Data, &m); err != nil {
 				t.Fatalf("thread.json decode: %v", err)
 			}
 			if m.ID != "conv1" || m.Title != "My Title" {
 				t.Errorf("thread.json = %+v, want id=conv1 title=My Title", m)
 			}
-			gotTitle = true
-		case "tokens.json":
-			var m struct{ Text, ID string }
-			_ = json.Unmarshal(ev.Data, &m)
-			lastText = m.Text
-			tokenCount++
-		case "new_message.json":
-			var m struct {
-				ID       string `json:"id"`
-				ThreadID string `json:"thread_id"`
-				State    string `json:"state"`
-				Reply    string `json:"reply"`
-				MD       string `json:"md"`
-			}
-			if err := json.Unmarshal(ev.Data, &m); err != nil {
-				t.Fatalf("new_message.json decode: %v", err)
-			}
-			if m.State != "done" {
-				t.Errorf("new_message state = %q, want done", m.State)
-			}
-			if m.ID != "asst1" || m.ThreadID != "conv1" {
-				t.Errorf("new_message ids = %q/%q, want asst1/conv1", m.ID, m.ThreadID)
-			}
-			finalMD, finalReply = m.MD, m.Reply
-			gotDone = true
-		}
-	}
-
-	if !gotTitle {
-		t.Error("no thread.json title event emitted")
-	}
-	if !gotDone {
-		t.Error("no terminal new_message.json emitted")
-	}
-	if tokenCount == 0 {
-		t.Error("no tokens.json events emitted")
-	}
-	if lastText != "Four" {
-		t.Errorf("last cumulative text = %q, want Four", lastText)
-	}
-	if finalMD != "Four" {
-		t.Errorf("final md = %q, want Four", finalMD)
-	}
-	if finalReply != "<p>Four</p>" {
-		t.Errorf("final reply = %q, want <p>Four</p>", finalReply)
-	}
-}
-
-func TestRelaySSE_TitleEmittedOnce(t *testing.T) {
-	// The same title appearing on multiple frames must only emit one
-	// thread.json event.
-	raw := strings.Join([]string{
-		`data: {"text":"","is_final":false,"conversation_title":"T"}`,
-		``,
-		`data: {"text":"a","is_final":false,"conversation_title":"T"}`,
-		``,
-		`data: {"text":"ab","is_final":true,"assistant_message_uuid":"m"}`,
-		``,
-		`data: [DONE]`,
-		``,
-	}, "\n")
-
-	evs, _ := collectSSE(t, raw, "conv1")
-	titles := 0
-	for _, ev := range evs {
-		if ev.Type == "thread.json" {
 			titles++
 		}
 	}
 	if titles != 1 {
 		t.Errorf("thread.json emitted %d times, want 1", titles)
 	}
-}
-
-func TestRelaySSE_ErrorFrame(t *testing.T) {
-	raw := strings.Join([]string{
-		`data: {"text":"","is_final":false}`,
-		``,
-		`data: {"error":"upstream boom"}`,
-		``,
-	}, "\n")
-
-	_, err := collectSSE(t, raw, "conv1")
-	if err == nil || !strings.Contains(err.Error(), "upstream boom") {
-		t.Fatalf("expected error containing 'upstream boom', got %v", err)
+	got := tokenTexts(evs)
+	want := []string{"Fo", "Four"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("tokens = %q, want %q (cumulative, only on change)", got, want)
+	}
+	// The terminal event needs the persisted HTML, so relaySSE leaves it to
+	// the caller.
+	if n := len(finals(evs)); n != 0 {
+		t.Errorf("relaySSE emitted %d terminal events, want 0", n)
 	}
 }
 
-func TestRelaySSE_FallbackConvUUID(t *testing.T) {
-	// When a frame omits conversation_uuid, relaySSE substitutes the one
-	// resolved at chat start.
-	raw := strings.Join([]string{
-		`data: {"text":"hi","is_final":true,"assistant_message_uuid":"m","conversation_title":"X"}`,
-		``,
-		`data: [DONE]`,
-		``,
-	}, "\n")
+func TestRelaySSE_OnlyRootTextIsTheAnswer(t *testing.T) {
+	// Thinking deltas and a sub-agent's text (nested under a tool node) are not
+	// part of the reply; two root-level text steps are joined in order.
+	raw := ev("1-0", 1, "turn.started", "", "", `{"root_node_id":"r1"}`) +
+		ev("", 2, "node.created", "r1", "", `{"kind":"assistant_message"}`) +
+		ev("", 3, "node.created", "a1", "r1", `{"kind":"text"}`) +
+		ev("", 4, "node.delta", "a1", "r1", `{"delta":"Let me look."}`) +
+		ev("", 5, "node.created", "think", "r1", `{"kind":"activity","type":"thinking"}`) +
+		ev("", 6, "node.delta", "think", "r1", `{"delta":"pondering"}`) +
+		ev("", 7, "node.completed", "think", "r1", `{"content":"pondering"}`) +
+		ev("", 8, "node.created", "tool", "r1", `{"kind":"activity","type":"tool_call"}`) +
+		ev("", 9, "node.created", "sub", "tool", `{"kind":"text"}`) +
+		ev("", 10, "node.delta", "sub", "tool", `{"delta":"sub-agent notes"}`) +
+		ev("", 11, "node.completed", "tool", "r1", `{"result":{"type":"tool_return","content":"raw results"}}`) +
+		ev("", 12, "node.created", "a2", "r1", `{"kind":"text"}`) +
+		ev("", 13, "node.delta", "a2", "r1", `{"delta":"Paris."}`)
 
-	evs, _ := collectSSE(t, raw, "fallback-conv")
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			var m struct {
-				ThreadID string `json:"thread_id"`
-			}
-			_ = json.Unmarshal(ev.Data, &m)
-			if m.ThreadID != "fallback-conv" {
-				t.Errorf("thread_id = %q, want fallback-conv", m.ThreadID)
-			}
+	evs, _, st := collectSSE(t, raw)
+	if got := st.replyText(); got != "Let me look.\n\nParis." {
+		t.Errorf("reply = %q, want both root text steps and nothing else", got)
+	}
+	for _, text := range tokenTexts(evs) {
+		if strings.Contains(text, "pondering") || strings.Contains(text, "sub-agent") || strings.Contains(text, "raw results") {
+			t.Errorf("token leaked non-answer text: %q", text)
 		}
 	}
 }
 
-func TestMessageBody_BaseVsProfile(t *testing.T) {
-	// Base model: model_name set, no profile_uuid.
+func TestRelaySSE_ReplayIsNotAppliedTwice(t *testing.T) {
+	// A reconnect can replay the turn from the start under fresh SSE ids. The
+	// deltas must not be appended a second time.
+	first := ev("1-0", 1, "turn.started", "", "", `{"root_node_id":"r1"}`) +
+		ev("2-0", 2, "node.created", "n1", "r1", `{"kind":"text"}`) +
+		ev("3-0", 3, "node.delta", "n1", "r1", `{"delta":"Fo"}`)
+
+	_, err, st := collectSSE(t, first)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("truncated stream should end in io.EOF, got %v", err)
+	}
+	if st.ended {
+		t.Error("state marked ended without the turn ending")
+	}
+	if st.cursor != "3-0" {
+		t.Errorf("cursor = %q, want 3-0", st.cursor)
+	}
+
+	replay := ev("90-0", 1, "turn.started", "", "", `{"root_node_id":"r1"}`) +
+		ev("91-0", 2, "node.created", "n1", "r1", `{"kind":"text"}`) +
+		ev("92-0", 3, "node.delta", "n1", "r1", `{"delta":"Fo"}`) +
+		ev("93-0", 4, "node.delta", "n1", "r1", `{"delta":"ur"}`) +
+		ev("94-0", 5, "turn.completed", "", "", `{}`)
+
+	evs, _, st := collectSSEState(t, replay, st)
+	if got := st.replyText(); got != "Four" {
+		t.Errorf("reply after replay = %q, want Four", got)
+	}
+	if got := tokenTexts(evs); len(got) != 1 || got[0] != "Four" {
+		t.Errorf("tokens after replay = %q, want only the new text", got)
+	}
+	if !st.ended {
+		t.Error("turn.completed on the replay did not end the turn")
+	}
+}
+
+func TestRelaySSE_OtherTurnsDoNotEndOurs(t *testing.T) {
+	// A nested sub-turn finishing is not our turn finishing.
+	raw := ev("", 1, "turn.started", "", "", `{"root_node_id":"r1"}`) +
+		evOf("", "sub1", 1, "turn.started", "", "", `{"root_node_id":"s1"}`) +
+		evOf("", "sub1", 2, "turn.completed", "", "", `{}`)
+
+	_, _, st := collectSSE(t, raw)
+	if st.ended {
+		t.Error("a sub-turn's completion ended our turn")
+	}
+	if st.rootNode != "r1" {
+		t.Errorf("rootNode = %q, want r1 (not the sub-turn's root)", st.rootNode)
+	}
+}
+
+func TestRelaySSE_TurnFailedIsUpstreamError(t *testing.T) {
+	raw := ev("", 1, "turn.started", "", "", `{"root_node_id":"r1"}`) +
+		ev("", 2, "turn.failed", "", "", `{"error_code":"provider_error"}`)
+
+	_, err, _ := collectSSE(t, raw)
+	var ue *upstreamError
+	if !errors.As(err, &ue) {
+		t.Fatalf("expected *upstreamError, got %T (%v)", err, err)
+	}
+	if !strings.Contains(err.Error(), "provider_error") {
+		t.Errorf("err = %q, want the error code", err)
+	}
+}
+
+func TestRelaySSE_ErrorFrameIsUpstreamError(t *testing.T) {
+	_, err, _ := collectSSE(t, frame("", `{"error":"upstream boom"}`))
+	var ue *upstreamError
+	if !errors.As(err, &ue) || !strings.Contains(err.Error(), "upstream boom") {
+		t.Fatalf("expected *upstreamError with 'upstream boom', got %T (%v)", err, err)
+	}
+}
+
+func TestRelaySSE_StopsAtTurnEnd(t *testing.T) {
+	// A connection held open past the end must not keep folding events in.
+	raw := answerStream() + ev("10-0", 8, "node.delta", "n1", "r1", `{"delta":" more"}`)
+
+	_, err, st := collectSSE(t, raw)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v, want io.EOF right after the end", err)
+	}
+	if got := st.replyText(); got != "Four" {
+		t.Errorf("reply = %q, want Four", got)
+	}
+}
+
+func TestNewPrompt_BaseVsProfile(t *testing.T) {
 	base := NewPrompt("hello", "", "", "", "ki_quick", true)
 	if base.Profile.ID != "" || base.Profile.Model != "ki_quick" {
 		t.Errorf("base NewPrompt profile = %+v", base.Profile)
@@ -199,7 +285,6 @@ func TestMessageBody_BaseVsProfile(t *testing.T) {
 		t.Error("new-conversation prompt should have nil ThreadID")
 	}
 
-	// Follow-up: thread id set.
 	follow := NewPrompt("hi", "conv1", "parent1", "prof1", "model1", false)
 	if follow.Focus.ThreadID == nil || *follow.Focus.ThreadID != "conv1" {
 		t.Error("follow-up should carry the conversation id")
@@ -212,102 +297,7 @@ func TestMessageBody_BaseVsProfile(t *testing.T) {
 	}
 }
 
-func TestRelaySSE_TracksCursorAndResumes(t *testing.T) {
-	// First connection dies mid-turn: no is_final, no [DONE]. The state must
-	// carry the last event id so a reconnect can pick up from there.
-	first := strings.Join([]string{
-		`id: 1700000000001-0`,
-		`data: {"text":"Fo","conversation_uuid":"conv1","is_final":false,"html_content":"<p>Fo</p>","conversation_title":"T"}`,
-		``,
-		`id: 1700000000002-0`,
-		`data: {"text":"Four","conversation_uuid":"conv1","is_final":false,"html_content":"<p>Four</p>"}`,
-		``,
-	}, "\n")
-
-	evs, err, st := collectSSEState(t, first, "conv1", &sseState{cursor: "0-0"})
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("truncated stream should end in io.EOF, got %v", err)
-	}
-	if st.final || st.sawDone {
-		t.Error("state marked complete without a terminal frame")
-	}
-	if st.cursor != "1700000000002-0" {
-		t.Errorf("cursor = %q, want 1700000000002-0", st.cursor)
-	}
-	if st.frames != 2 {
-		t.Errorf("frames = %d, want 2", st.frames)
-	}
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			t.Error("terminal event emitted for a truncated stream")
-		}
-	}
-
-	// Reconnect: the terminal frame carries only `text`, so the html must come
-	// from the cumulative value captured before the drop.
-	second := strings.Join([]string{
-		`id: 1700000000003-0`,
-		`data: {"text":"Four!","conversation_uuid":"conv1","is_final":true,"assistant_message_uuid":"asst1"}`,
-		``,
-		`data: [DONE]`,
-		``,
-	}, "\n")
-
-	evs2, _, st2 := collectSSEState(t, second, "conv1", st)
-	if !st2.final {
-		t.Error("state not marked final after the terminal frame")
-	}
-	var titles, finals int
-	var md, reply string
-	for _, ev := range evs2 {
-		switch ev.Type {
-		case "thread.json":
-			titles++
-		case "new_message.json":
-			var m struct {
-				MD    string `json:"md"`
-				Reply string `json:"reply"`
-			}
-			_ = json.Unmarshal(ev.Data, &m)
-			md, reply = m.MD, m.Reply
-			finals++
-		}
-	}
-	if titles != 0 {
-		t.Errorf("title re-emitted %d times after reconnect, want 0", titles)
-	}
-	if finals != 1 {
-		t.Fatalf("terminal events = %d, want 1", finals)
-	}
-	if md != "Four!" {
-		t.Errorf("final md = %q, want Four!", md)
-	}
-	if reply != "<p>Four</p>" {
-		t.Errorf("final reply = %q, want the html carried across the reconnect", reply)
-	}
-}
-
-func TestRelaySSE_ErrorFrameIsNotRetryable(t *testing.T) {
-	// An error reported inside a frame is upstream's verdict on the turn;
-	// pumpStream must be able to tell it apart from a transport drop.
-	raw := "data: {\"error\":\"upstream boom\"}\n\n"
-
-	_, err := collectSSE(t, raw, "conv1")
-	var ue *upstreamError
-	if !errors.As(err, &ue) {
-		t.Fatalf("expected *upstreamError, got %T (%v)", err, err)
-	}
-}
-
-// --- pumpStream reconnect behaviour -----------------------------------------
-
-// testTurn is the chatTurn the stream tests post as.
-var testTurn = chatTurn{
-	branchUUID:  "b1",
-	convUUID:    "conv1",
-	streamURL:   "/api/branches/b1/stream",
-	userMsgUUID: "u1",
-}
+// --- startChat --------------------------------------------------------------
 
 // newStreamTestClient points a Client at a local test server.
 func newStreamTestClient(t *testing.T, h http.Handler) *Client {
@@ -318,6 +308,61 @@ func newStreamTestClient(t *testing.T, h http.Handler) *Client {
 	c.apiBase = srv.URL
 	return c
 }
+
+func TestStartChat_NewConversationDispatchesInOneCall(t *testing.T) {
+	var got map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v2/conversations", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Write([]byte(`{"conversation_uuid":"conv9","branch_uuid":"b9","assistant_turn_uuid":"t9","user_turn_uuid":"u9"}`))
+	})
+
+	c := newStreamTestClient(t, mux)
+	turn, err := c.startChat(context.Background(), NewPrompt("hi", "", "", "", "m1", false))
+	if err != nil {
+		t.Fatalf("startChat: %v", err)
+	}
+	if got["content"] != "hi" || got["model"] != "m1" || got["enable_search"] != false {
+		t.Errorf("body = %v, want content=hi model=m1 enable_search=false", got)
+	}
+	if _, ok := got["profile_uuid"]; ok {
+		t.Errorf("body = %v, want no profile_uuid for a base model", got)
+	}
+	want := chatTurn{convUUID: "conv9", branchUUID: "b9", turnUUID: "t9", streamURL: "/api/v2/turns/t9/stream"}
+	if turn != want {
+		t.Errorf("turn = %+v, want %+v", turn, want)
+	}
+}
+
+func TestStartChat_FollowUpUsesReportedBranch(t *testing.T) {
+	// The server may answer on a different branch than the one we named; the
+	// persisted row is then read from that one.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/conversations/conv1/init", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"conversation":{"uuid":"conv1"},"active_branch":{"uuid":"old-branch"},"messages":{"items":[]}}`))
+	})
+	mux.HandleFunc("POST /api/v2/branches/old-branch/respond", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"assistant_turn_uuid":"t9","branch_uuid":"forked-branch","conversation_uuid":"conv1","user_turn_uuid":"u9"}`))
+	})
+
+	c := newStreamTestClient(t, mux)
+	turn, err := c.startChat(context.Background(), NewPrompt("hi", "conv1", "", "", "m", false))
+	if err != nil {
+		t.Fatalf("startChat: %v", err)
+	}
+	if turn.branchUUID != "forked-branch" || turn.turnUUID != "t9" {
+		t.Errorf("turn = %+v, want branch forked-branch, turn t9", turn)
+	}
+}
+
+func TestStartChat_RequiresModelOrProfile(t *testing.T) {
+	c := New("s")
+	if _, err := c.startChat(context.Background(), NewPrompt("hi", "", "", "", "", false)); err == nil {
+		t.Fatal("expected an error without model or profile")
+	}
+}
+
+// --- pumpStream -------------------------------------------------------------
 
 // drain runs pumpStream over an already-open first connection and collects the
 // events it emits.
@@ -339,129 +384,172 @@ func drain(t *testing.T, c *Client, turn chatTurn) ([]Event, error) {
 		close(done)
 	}()
 	var evs []Event
-	for ev := range out {
-		evs = append(evs, ev)
+	for e := range out {
+		evs = append(evs, e)
 	}
 	<-done
 	return evs, perr
 }
 
-func TestPumpStream_ReconnectsAfterDrop(t *testing.T) {
-	// Mirrors the real failure: the first connection is killed mid-turn (the
-	// edge proxy resets it once the cumulative frames get large), and the
-	// answer only arrives on the reconnect.
-	var connects int32
+// turnsHandler serves a branch's persisted turns.
+func turnsHandler(rows string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"turns":[` + rows + `],"has_more":false}`))
+	}
+}
+
+const (
+	turnsPath    = "/api/v2/branches/b1/turns"
+	streamPath   = "/api/v2/turns/t1/stream"
+	completedRow = `{"uuid":"t1","role":"assistant","status":"completed","content":"Four","html_content":"<p>Four</p>"}`
+)
+
+// onlyFinal returns the single terminal event, failing otherwise.
+func onlyFinal(t *testing.T, evs []Event) doneEvent {
+	t.Helper()
+	f := finals(evs)
+	if len(f) != 1 {
+		t.Fatalf("terminal events = %d, want 1", len(f))
+	}
+	return f[0]
+}
+
+func TestPumpStream_FinishesWithPersistedHTML(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&connects, 1)
-		cursor := r.URL.Query().Get("cursor")
-		w.Header().Set("Content-Type", "text/event-stream")
-		if n == 1 {
-			if cursor != "0-0" {
-				t.Errorf("first connect cursor = %q, want 0-0", cursor)
-			}
-			io.WriteString(w, "id: 10-0\ndata: {\"text\":\"partial\",\"conversation_uuid\":\"conv1\",\"is_final\":false,\"html_content\":\"<p>partial</p>\"}\n\n")
-			// Close without a terminal frame.
-			return
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("cursor") {
+			t.Errorf("first connect sent cursor %q, want none", r.URL.Query().Get("cursor"))
 		}
-		if cursor != "10-0" {
-			t.Errorf("reconnect cursor = %q, want 10-0", cursor)
-		}
-		io.WriteString(w, "id: 11-0\ndata: {\"text\":\"complete\",\"conversation_uuid\":\"conv1\",\"is_final\":true,\"assistant_message_uuid\":\"asst1\"}\n\ndata: [DONE]\n\n")
+		io.WriteString(w, answerStream())
 	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":true,"branch_uuid":"b1"}`))
+	mux.HandleFunc(turnsPath, turnsHandler(`{"uuid":"u1","role":"user","content":"q"},`+completedRow))
+
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
+	if err != nil {
+		t.Fatalf("pumpStream: %v", err)
+	}
+	want := doneEvent{ID: "t1", ThreadID: "conv1", State: "done", Reply: "<p>Four</p>", MD: "Four"}
+	if got := onlyFinal(t, evs); got != want {
+		t.Errorf("final = %+v, want %+v", got, want)
+	}
+}
+
+func TestPumpStream_FinishKeepsStreamedTextWhenLookupFails(t *testing.T) {
+	// The answer arrived on the wire; failing to read the persisted row must
+	// cost only the HTML, not the answer.
+	mux := http.NewServeMux()
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, answerStream())
+	})
+	mux.HandleFunc(turnsPath, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"code":"unavailable","message":"later"}}`, http.StatusServiceUnavailable)
 	})
 
-	c := newStreamTestClient(t, mux)
-	evs, err := drain(t, c, testTurn)
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
+	if err != nil {
+		t.Fatalf("pumpStream: %v", err)
+	}
+	if got := onlyFinal(t, evs); got.MD != "Four" || got.Reply != "" {
+		t.Errorf("final md/reply = %q/%q, want the streamed text and no html", got.MD, got.Reply)
+	}
+}
+
+func TestPumpStream_FinishWaitsForPersistedRow(t *testing.T) {
+	// The stream ended but the row still says running; the HTML must not be
+	// dropped just because persistence trails the wire by a beat.
+	var reads int32
+	mux := http.NewServeMux()
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, answerStream())
+	})
+	mux.HandleFunc(turnsPath, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&reads, 1) == 1 {
+			turnsHandler(`{"uuid":"t1","role":"assistant","status":"running","content":"Fo"}`)(w, r)
+			return
+		}
+		turnsHandler(completedRow)(w, r)
+	})
+
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
+	if err != nil {
+		t.Fatalf("pumpStream: %v", err)
+	}
+	if got := onlyFinal(t, evs); got.Reply != "<p>Four</p>" {
+		t.Errorf("final reply = %q, want the html once the row completed", got.Reply)
+	}
+}
+
+func TestPumpStream_ReconnectsAfterDrop(t *testing.T) {
+	// The first connection is killed mid-turn and the rest of the answer only
+	// arrives on the reconnect, which must resume from the last id.
+	var connects int32
+	mux := http.NewServeMux()
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
+		cursor := r.URL.Query().Get("cursor")
+		if atomic.AddInt32(&connects, 1) == 1 {
+			io.WriteString(w, ev("1-0", 1, "turn.started", "", "", `{"root_node_id":"r1"}`)+
+				ev("2-0", 2, "node.created", "n1", "r1", `{"kind":"text"}`)+
+				ev("3-0", 3, "node.delta", "n1", "r1", `{"delta":"Fo"}`))
+			return
+		}
+		if cursor != "3-0" {
+			t.Errorf("reconnect cursor = %q, want 3-0", cursor)
+		}
+		io.WriteString(w, ev("4-0", 4, "node.delta", "n1", "r1", `{"delta":"ur"}`)+
+			ev("5-0", 5, "turn.completed", "", "", `{}`)+
+			frame("6-0", `{"is_final":true}`))
+	})
+	mux.HandleFunc(turnsPath, turnsHandler(completedRow))
+
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
 	if err != nil {
 		t.Fatalf("pumpStream: %v", err)
 	}
 	if got := atomic.LoadInt32(&connects); got != 2 {
 		t.Errorf("connections = %d, want 2", got)
 	}
-
-	var finals int
-	var md, reply string
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			var m struct {
-				MD    string `json:"md"`
-				Reply string `json:"reply"`
-			}
-			_ = json.Unmarshal(ev.Data, &m)
-			md, reply = m.MD, m.Reply
-			finals++
-		}
-	}
-	if finals != 1 {
-		t.Fatalf("terminal events = %d, want 1", finals)
-	}
-	if md != "complete" {
-		t.Errorf("final md = %q, want complete", md)
-	}
-	if reply != "<p>partial</p>" {
-		t.Errorf("final reply = %q, want the html carried across the reconnect", reply)
+	if got := onlyFinal(t, evs); got.MD != "Four" {
+		t.Errorf("final md = %q, want Four", got.MD)
 	}
 }
 
 func TestPumpStream_RecoversPersistedAnswer(t *testing.T) {
-	// The stream is exhausted and the turn is over, but no terminal frame was
-	// ever seen. The answer landed in the conversation anyway, so it must be
-	// recovered rather than reported as lost.
+	// The stream is exhausted and the turn is over, but its end was never
+	// seen. The answer landed on the branch anyway, so it must be recovered.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":false,"branch_uuid":"b1"}`))
-	})
-	mux.HandleFunc("/api/conversations/conv1/init", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"conversation":{"uuid":"conv1","title":"T"},
-			"active_branch":{"uuid":"b1","head_message_uuid":"asst1"},
-			"messages":{"items":[
-				{"uuid":"u1","role":"user","content":"q"},
-				{"uuid":"asst1","role":"assistant","parent_message_uuid":"u1","content":"the answer","html_content":"<p>the answer</p>"}
-			]}}`))
-	})
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc(turnsPath, turnsHandler(completedRow))
 
-	c := newStreamTestClient(t, mux)
-	evs, err := drain(t, c, testTurn)
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
 	if err != nil {
 		t.Fatalf("pumpStream: %v", err)
 	}
-	var md, reply string
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			var m struct {
-				MD    string `json:"md"`
-				Reply string `json:"reply"`
-			}
-			_ = json.Unmarshal(ev.Data, &m)
-			md, reply = m.MD, m.Reply
-		}
-	}
-	if md != "the answer" || reply != "<p>the answer</p>" {
-		t.Errorf("recovered md/reply = %q/%q, want the persisted assistant message", md, reply)
+	if got := onlyFinal(t, evs); got.MD != "Four" || got.Reply != "<p>Four</p>" {
+		t.Errorf("recovered md/reply = %q/%q, want the persisted turn", got.MD, got.Reply)
 	}
 }
 
-func TestPumpStream_ErrorFrameDoesNotReconnect(t *testing.T) {
+func TestPumpStream_PersistedFailureIsReported(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc(turnsPath, turnsHandler(`{"uuid":"t1","role":"assistant","status":"failed","error_code":"quota","content":""}`))
+
+	_, err := drain(t, newStreamTestClient(t, mux), testTurn)
+	if err == nil || !strings.Contains(err.Error(), "quota") {
+		t.Fatalf("err = %v, want the persisted failure with its code", err)
+	}
+}
+
+func TestPumpStream_UpstreamErrorDoesNotReconnect(t *testing.T) {
 	var connects int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&connects, 1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: {\"error\":\"upstream boom\"}\n\n")
-	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":true,"branch_uuid":"b1"}`))
+		io.WriteString(w, ev("1-0", 1, "turn.failed", "", "", `{"error_code":"boom"}`))
 	})
 
-	c := newStreamTestClient(t, mux)
-	_, err := drain(t, c, testTurn)
-	if err == nil || !strings.Contains(err.Error(), "upstream boom") {
+	_, err := drain(t, newStreamTestClient(t, mux), testTurn)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("err = %v, want the upstream error", err)
 	}
 	if got := atomic.LoadInt32(&connects); got != 1 {
@@ -470,79 +558,21 @@ func TestPumpStream_ErrorFrameDoesNotReconnect(t *testing.T) {
 }
 
 func TestPumpStream_IgnoresPreviousTurnsAnswer(t *testing.T) {
-	// The turn died with nothing persisted. The conversation still holds the
+	// The turn died with nothing persisted. The branch still holds the
 	// *previous* turn's reply, which must not be passed off as this one's.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":false,"branch_uuid":"b1"}`))
-	})
-	mux.HandleFunc("/api/conversations/conv1/init", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"conversation":{"uuid":"conv1"},
-			"active_branch":{"uuid":"b1"},
-			"messages":{"items":[
-				{"uuid":"u0","role":"user","content":"earlier q"},
-				{"uuid":"asst0","role":"assistant","parent_message_uuid":"u0","content":"earlier answer"},
-				{"uuid":"u1","role":"user","parent_message_uuid":"asst0","content":"q"}
-			]}}`))
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc(turnsPath, turnsHandler(`{"uuid":"t0","role":"assistant","status":"completed","content":"earlier answer"}`))
+	mux.HandleFunc("/api/billing/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"can_proceed":true}`))
 	})
 
-	c := newStreamTestClient(t, mux)
-	evs, err := drain(t, c, testTurn)
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
 	if err == nil {
 		t.Fatal("expected a premature-end error, got nil")
 	}
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			t.Fatalf("emitted a terminal event from a stale message: %s", ev.Data)
-		}
-	}
-}
-
-func TestPumpStream_RecoversWhenDoneArrivesWithoutTerminalFrame(t *testing.T) {
-	// The stream reaches [DONE] but the is_final frame never made it. The
-	// answer is in the conversation, so it must be recovered rather than
-	// reported as a completed-but-empty turn.
-	var connects int32
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&connects, 1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "id: 10-0\ndata: {\"text\":\"partial\",\"conversation_uuid\":\"conv1\",\"is_final\":false}\n\ndata: [DONE]\n\n")
-	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":false,"branch_uuid":"b1"}`))
-	})
-	mux.HandleFunc("/api/conversations/conv1/init", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"conversation":{"uuid":"conv1"},"active_branch":{"uuid":"b1"},
-			"messages":{"items":[
-				{"uuid":"u1","role":"user","content":"q"},
-				{"uuid":"asst1","role":"assistant","parent_message_uuid":"u1","content":"the answer","html_content":"<p>the answer</p>"}
-			]}}`))
-	})
-
-	c := newStreamTestClient(t, mux)
-	evs, err := drain(t, c, testTurn)
-	if err != nil {
-		t.Fatalf("pumpStream: %v", err)
-	}
-	if got := atomic.LoadInt32(&connects); got != 1 {
-		t.Errorf("connections = %d, want 1 ([DONE] means no point reconnecting)", got)
-	}
-	var md string
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			var m struct {
-				MD string `json:"md"`
-			}
-			_ = json.Unmarshal(ev.Data, &m)
-			md = m.MD
-		}
-	}
-	if md != "the answer" {
-		t.Errorf("recovered md = %q, want the persisted answer", md)
+	if f := finals(evs); len(f) != 0 {
+		t.Fatalf("emitted a terminal event from a stale turn: %+v", f)
 	}
 }
 
@@ -551,98 +581,27 @@ func TestPumpStream_RetriesWhenReopenFails(t *testing.T) {
 	// it counts as a stall, and the next attempt succeeds.
 	var connects int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
 		switch atomic.AddInt32(&connects, 1) {
 		case 1:
-			w.Header().Set("Content-Type", "text/event-stream")
-			io.WriteString(w, "id: 10-0\ndata: {\"text\":\"partial\",\"conversation_uuid\":\"conv1\",\"is_final\":false}\n\n")
+			io.WriteString(w, ev("1-0", 1, "turn.started", "", "", `{"root_node_id":"r1"}`))
 		case 2:
 			http.Error(w, `{"error":{"code":"unavailable","message":"try later"}}`, http.StatusServiceUnavailable)
 		default:
-			w.Header().Set("Content-Type", "text/event-stream")
-			io.WriteString(w, "id: 11-0\ndata: {\"text\":\"complete\",\"conversation_uuid\":\"conv1\",\"is_final\":true,\"assistant_message_uuid\":\"asst1\"}\n\ndata: [DONE]\n\n")
+			io.WriteString(w, answerStream())
 		}
 	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":true,"branch_uuid":"b1"}`))
-	})
+	mux.HandleFunc(turnsPath, turnsHandler(`{"uuid":"t1","role":"assistant","status":"running","content":""}`))
 
-	c := newStreamTestClient(t, mux)
-	evs, err := drain(t, c, testTurn)
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
 	if err != nil {
 		t.Fatalf("pumpStream: %v", err)
 	}
 	if got := atomic.LoadInt32(&connects); got != 3 {
 		t.Errorf("connections = %d, want 3 (initial, failed reopen, success)", got)
 	}
-	var md string
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			var m struct {
-				MD string `json:"md"`
-			}
-			_ = json.Unmarshal(ev.Data, &m)
-			md = m.MD
-		}
-	}
-	if md != "complete" {
-		t.Errorf("final md = %q, want complete", md)
-	}
-}
-
-func TestStartChat_FollowsForkedBranch(t *testing.T) {
-	// Posting can fork a branch; the reply then streams from the branch in the
-	// response, which is also the one whose status we must poll.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/conversations/conv1/init", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"conversation":{"uuid":"conv1"},"active_branch":{"uuid":"old-branch"},"messages":{"items":[]}}`))
-	})
-	mux.HandleFunc("/api/branches/old-branch/messages", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"branch":{"uuid":"forked-branch"},
-			"user_message":{"uuid":"u9"},
-			"stream_url":"/api/branches/forked-branch/stream"}`))
-	})
-
-	c := newStreamTestClient(t, mux)
-	turn, err := c.startChat(context.Background(), NewPrompt("hi", "conv1", "", "", "m", false))
-	if err != nil {
-		t.Fatalf("startChat: %v", err)
-	}
-	if turn.branchUUID != "forked-branch" {
-		t.Errorf("branchUUID = %q, want forked-branch", turn.branchUUID)
-	}
-	if turn.userMsgUUID != "u9" {
-		t.Errorf("userMsgUUID = %q, want u9", turn.userMsgUUID)
-	}
-	if turn.streamURL != "/api/branches/forked-branch/stream" {
-		t.Errorf("streamURL = %q", turn.streamURL)
-	}
-}
-
-func TestRelaySSE_StopsAtTerminalFrame(t *testing.T) {
-	// A second is_final frame (or a connection held open past the first) must
-	// not produce a second terminal event.
-	raw := strings.Join([]string{
-		`id: 1-0`,
-		`data: {"text":"done","conversation_uuid":"conv1","is_final":true,"assistant_message_uuid":"asst1"}`,
-		``,
-		`id: 2-0`,
-		`data: {"text":"done again","conversation_uuid":"conv1","is_final":true,"assistant_message_uuid":"asst2"}`,
-		``,
-	}, "\n")
-
-	evs, err := collectSSE(t, raw, "conv1")
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("err = %v, want io.EOF right after the terminal frame", err)
-	}
-	finals := 0
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			finals++
-		}
-	}
-	if finals != 1 {
-		t.Errorf("terminal events = %d, want 1", finals)
+	if got := onlyFinal(t, evs); got.MD != "Four" {
+		t.Errorf("final md = %q, want Four", got.MD)
 	}
 }
 
@@ -650,11 +609,12 @@ func TestPumpStream_UnblocksOnCancel(t *testing.T) {
 	// A consumer that cancels and walks away must not leave the stream
 	// goroutine wedged on a full channel.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
 		flusher, _ := w.(http.Flusher)
+		io.WriteString(w, ev("", 1, "turn.started", "", "", `{"root_node_id":"r1"}`)+
+			ev("", 2, "node.created", "n1", "r1", `{"kind":"text"}`))
 		for i := 0; i < 1000; i++ {
-			io.WriteString(w, "id: 1-0\ndata: {\"text\":\"x\",\"conversation_uuid\":\"conv1\",\"is_final\":false}\n\n")
+			io.WriteString(w, ev("", 3+i, "node.delta", "n1", "r1", `{"delta":"x"}`))
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -692,38 +652,19 @@ func TestPumpStream_RecoveryEmitsTokensForStreamMode(t *testing.T) {
 	// `kagi chat --stream` prints only tokens.json, so a recovered answer has
 	// to arrive as a token frame too, not just in the terminal event.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "id: 10-0\ndata: {\"text\":\"partial\",\"conversation_uuid\":\"conv1\",\"is_final\":false}\n\ndata: [DONE]\n\n")
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, ev("1-0", 1, "turn.started", "", "", `{"root_node_id":"r1"}`)+
+			ev("2-0", 2, "node.delta", "n1", "r1", `{"delta":"partial"}`))
 	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":false,"branch_uuid":"b1"}`))
-	})
-	mux.HandleFunc("/api/conversations/conv1/init", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"conversation":{"uuid":"conv1"},"active_branch":{"uuid":"b1"},
-			"messages":{"items":[
-				{"uuid":"u1","role":"user","content":"q"},
-				{"uuid":"asst1","role":"assistant","parent_message_uuid":"u1","content":"partial then the rest","html_content":"<p>x</p>"}
-			]}}`))
-	})
+	mux.HandleFunc(turnsPath, turnsHandler(`{"uuid":"t1","role":"assistant","status":"completed","content":"partial then the rest"}`))
 
-	c := newStreamTestClient(t, mux)
-	evs, err := drain(t, c, testTurn)
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
 	if err != nil {
 		t.Fatalf("pumpStream: %v", err)
 	}
-	var lastToken string
-	for _, ev := range evs {
-		if ev.Type == "tokens.json" {
-			var m struct {
-				Text string `json:"text"`
-			}
-			_ = json.Unmarshal(ev.Data, &m)
-			lastToken = m.Text
-		}
-	}
-	if lastToken != "partial then the rest" {
-		t.Errorf("last token text = %q, want the full recovered answer", lastToken)
+	texts := tokenTexts(evs)
+	if len(texts) == 0 || texts[len(texts)-1] != "partial then the rest" {
+		t.Errorf("token texts = %q, want the full recovered answer last", texts)
 	}
 }
 
@@ -731,37 +672,17 @@ func TestOpenStream_AcceptsNoContent(t *testing.T) {
 	// 204 means the turn's stream is gone. That has to read as an empty stream
 	// so recovery runs, not as a hard error that drops the answer.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":false,"branch_uuid":null}`))
-	})
-	mux.HandleFunc("/api/conversations/conv1/init", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"conversation":{"uuid":"conv1"},"active_branch":{"uuid":"b1"},
-			"messages":{"items":[
-				{"uuid":"u1","role":"user","content":"q"},
-				{"uuid":"asst1","role":"assistant","parent_message_uuid":"u1","content":"late answer","html_content":"<p>late</p>"}
-			]}}`))
-	})
+	mux.HandleFunc(turnsPath, turnsHandler(`{"uuid":"t1","role":"assistant","status":"completed","content":"late answer","html_content":"<p>late</p>"}`))
 
-	c := newStreamTestClient(t, mux)
-	evs, err := drain(t, c, testTurn)
+	evs, err := drain(t, newStreamTestClient(t, mux), testTurn)
 	if err != nil {
 		t.Fatalf("pumpStream: %v", err)
 	}
-	var md string
-	for _, ev := range evs {
-		if ev.Type == "new_message.json" {
-			var m struct {
-				MD string `json:"md"`
-			}
-			_ = json.Unmarshal(ev.Data, &m)
-			md = m.MD
-		}
-	}
-	if md != "late answer" {
-		t.Errorf("md = %q, want the recovered answer after a 204", md)
+	if got := onlyFinal(t, evs); got.MD != "late answer" {
+		t.Errorf("md = %q, want the recovered answer after a 204", got.MD)
 	}
 }
 
@@ -773,26 +694,19 @@ func TestPrematureEnd_PointsAtTheConversation(t *testing.T) {
 }
 
 func TestPumpStream_NamesTheUsageCap(t *testing.T) {
-	// Hitting the usage cap kills a turn mid-generation with no error frame and
-	// nothing persisted. The failure must say so rather than read as a network
-	// problem.
+	// Hitting the usage cap kills a turn mid-generation with no error event
+	// and nothing persisted. The failure must say so rather than read as a
+	// network problem.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/branches/b1/stream", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(streamPath, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("/api/branches/b1/stream/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"active":false,"branch_uuid":null}`))
-	})
-	mux.HandleFunc("/api/conversations/conv1/init", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"conversation":{"uuid":"conv1"},"active_branch":{"uuid":"b1"},
-			"messages":{"items":[{"uuid":"u1","role":"user","content":"q"}]}}`))
-	})
+	mux.HandleFunc(turnsPath, turnsHandler(`{"uuid":"u1","role":"user","content":"q"}`))
 	mux.HandleFunc("/api/billing/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"limit":"hard","reason":"cost","can_proceed":false}`))
 	})
 
-	c := newStreamTestClient(t, mux)
-	_, err := drain(t, c, testTurn)
+	_, err := drain(t, newStreamTestClient(t, mux), testTurn)
 	if err == nil {
 		t.Fatal("expected an error")
 	}

@@ -21,8 +21,8 @@ network traffic for the **new** `assistant.kagi.com` app.
 | Concern            | v1 (`kagi.com/assistant/*`)                              | v2 (`assistant.kagi.com/api/*`)                                  |
 | ------------------ | ------------------------------------------------------- | ---------------------------------------------------------------- |
 | Auth               | `kagi_session` cookie                                   | **same** `kagi_session` cookie (domain `.kagi.com`, shared)      |
-| Send a prompt      | one `POST /assistant/prompt`                            | three calls: create conv → post message → GET SSE stream         |
-| Stream format      | custom NUL-delimited `vnd.kagi.stream`                  | **standard SSE** (`text/event-stream`, `data: …` / `data: [DONE]`) |
+| Send a prompt      | one `POST /assistant/prompt`                            | dispatch a turn (`/api/v2/…`) → GET SSE turn stream              |
+| Stream format      | custom NUL-delimited `vnd.kagi.stream`                  | **standard SSE** of turn events (`node.delta`, …)                |
 | Thread             | `thread_id` + `message_id` + zero `branch_id`           | `conversation_uuid` + `branch_uuid` + `head_message_uuid`        |
 | Discovery          | scrape `<div id="json-profile-list">` HTML              | `GET /api/init` (one JSON blob)                                  |
 | Profiles           | `profiles[]` (`id`, `model`, `custom_instructions`)     | `custom_assistants[]` (`uuid`, `llm_id`, `instructions`)         |
@@ -220,142 +220,125 @@ default model id.
 > `thread_retention_policy` is `forever`. The CLI should delete its own
 > throwaway test conversations rather than rely on auto-expiry.
 
-## Chat — three-step flow
+## Chat — turns API (captured 2026-10-11)
 
-### 1. Create a conversation — `POST /api/conversations`
+> **Breaking change (2026-10).** The v2-messages flow (`POST /api/conversations`
+> → `POST /api/branches/{b}/messages` → `GET /api/branches/{b}/stream`) is gone:
+> `POST …/messages` answers **405 Method Not Allowed** and
+> `GET …/stream/status` answers 404. Chat moved to an event-sourced **turns**
+> API under `/api/v2/*`. `POST /api/conversations` and
+> `GET /api/conversations/{uuid}/init` still work, but the client no longer
+> needs the former.
+
+### 1a. New conversation + first turn — `POST /api/v2/conversations`
+
+One call creates the conversation and dispatches the first turn.
 
 ```json
-// request
-{"model_name": "ki_quick"}
-```
-
-```json
-// response
+// request — `content` is required; everything else optional
 {
-  "conversation": {"uuid": "c97a4478-…", "title": "New chat", "model_name": "ki_quick", "message_count": 0, …},
-  "default_branch": {
-    "uuid": "12b540e3-…",                       // ← branch_uuid for step 2
-    "conversation_uuid": "c97a4478-…",
-    "head_message_uuid": null,
-    "branch_point_parent_uuid": null,
-    "branch_child_message_uuid": null,
-    "is_default": true,
-    "message_count": 0
-  }
-}
-```
-
-A conversation owns one or more **branches**; you post messages to a branch,
-not to the conversation directly.
-
-### 2. Post the user message — `POST /api/branches/{branch_uuid}/messages`
-
-```json
-// request
-{
-  "message": "What is 2+2? Answer in one word.",
-  "thinking_preset": null,         // model-dependent; null when supports_thinking=false
-  "model_name": "ki_quick",
-  "enable_search": true,           // was profile.internet_access
-  "personalization": true          // was profile.personalizations
+  "content": "Reply with exactly: hello world",
+  "model": "claude-5-5-haiku",       // or omit and pass profile_uuid alone
+  "profile_uuid": "843f5964-…",      // custom assistant; its own base model is used
+  "enable_search": false,
+  "personalization": true,
+  "lens_id": null,
+  "reasoning_effort": null,          // none|minimal|low|medium|high|xhigh|max
+  "attachment_uuids": null
 }
 ```
 
 ```json
 // response
 {
-  "branch": {"uuid": "1661ed71-…", "head_message_uuid": "13a37bb1-…", "message_count": 1, …},
-  "conversation": {…},
-  "user_message": {"uuid": "13a37bb1-…", "role": "user", "content": "What is 2+2?…", …},
-  "stream_url":        "/api/branches/1661ed71-…/stream",
-  "stream_status_url": "/api/branches/1661ed71-…/stream/status",
-  "stream_cancel_url": "/api/branches/1661ed71-…/stream/cancel"
+  "conversation_uuid": "39e273b1-…",
+  "branch_uuid": "79ea169d-…",
+  "assistant_turn_uuid": "60625205-…",   // ← stream this; it is also the persisted message uuid
+  "user_turn_uuid": "3b6b0da8-…",
+  "conversation": {…}
 }
 ```
 
-Use the returned `stream_url` (or build `…/stream?cursor=0-0`). Note the
-branch uuid in the *response* can differ from the one you posted to when the
-server forks a branch — always follow `stream_url`.
+### 1b. Follow-up turn — `POST /api/v2/branches/{branch_uuid}/respond`
 
-### 3. Read the reply — `GET /api/branches/{branch_uuid}/stream?cursor=0-0`
+Same body (plus `choice`, `plan_action`, `refused`, `current_location` for
+elicitations). Resolve the branch via `GET /api/conversations/{uuid}/init` →
+`active_branch.uuid`. Response: `{assistant_turn_uuid, branch_uuid,
+conversation_uuid, user_turn_uuid}`. "Smart-dispatched": if the branch's latest
+assistant turn is paused on `ask_user`, the content answers it and
+`user_turn_uuid` is null. Follow the `branch_uuid` in the response.
 
-Standard **Server-Sent Events** (`text/event-stream; charset=utf-8`). Each
-event is `id:` + `data:` (JSON), separated by a blank line; the stream ends
-with a literal `data: [DONE]`.
+`POST /api/v2/branches` forks (`fork_from_turn_uuid`, or `conversation_uuid`
+for a root fork) — used for regenerate/edit; not needed by this client.
+
+### 2. Read the reply — `GET /api/v2/turns/{assistant_turn_uuid}/stream[?cursor=…]`
+
+SSE (`text/event-stream`). The web client omits `cursor` on the first read.
+There is **no `[DONE]` sentinel**; the connection closes after the
+`is_final` frame. Most frames wrap one event of the turn's log:
 
 ```
-id: 1782183846169-0
-data: {"text":"","conversation_uuid":"b1b1…","branch_uuid":"1661…","is_final":false,"conversation_title":"Mathematical Addition Result"}
+id: 1791687806289-0
+data: {"event": {"seq": 1, "turn_id": "6062…", "source": "system", "type": "turn.started",
+                 "payload": {"root_node_id": "msg_2a44…", "tier": "quick", "branch_uuid": "79ea…"}, …}}
 
-id: 1782183846172-0
-data: {"text":"","conversation_uuid":"b1b1…","branch_uuid":"1661…","is_final":false,"model_name":"ki_quick","html_content":"<p>Four</p>"}
-
-id: 1782183846424-0
-data: {"text":"Four","is_final":true,"model_name":"ki_quick","model_version":"ki_quick-2026-05-22",
-       "timing":{"prep_ms":0,"ttft_ms":290,"llm_streaming_ms":213,"finalize_ms":37,"backend_total_ms":542},
-       "usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4,"cost_usd":0.000012,"tokens_per_second":3.0},
-       "context_usage":{"context_window":128000,"total_used":4,"available":127996,"used_percent":0},
-       "duration_ms":300,"assistant_message_uuid":"8f4995a3-…",
-       "billing":{"limit":"none","can_proceed":true,"usage":{…},"ack":{"soft":false,"hard":false}}}
-
-data: [DONE]
+data: {"event": {"seq": 2, "type": "node.created", "node_id": "msg_2a44…", "payload": {"kind": "assistant_message", "status": "running"}}}
+data: {"title": "Hello World Greeting"}
+data: {"event": {"seq": 3, "type": "node.created", "node_id": "text_44c9…", "parent_node_id": "msg_2a44…",
+                 "payload": {"kind": "text", "format": "markdown", "status": "running", "step": 1}}}
+data: {"event": {"seq": 4, "type": "node.delta", "node_id": "text_44c9…", "payload": {"delta": "hello world"}}}
+data: {"event": {"seq": 5, "type": "node.completed", "node_id": "text_44c9…", "payload": {"status": "completed", "content": "hello world"}}}
+data: {"event": {"seq": 7, "type": "turn.completed", "payload": {"root_node_id": "…", "usage": {"input_tokens": 4813, "output_tokens": 5, "cost_usd": 0.000725, …}}}}
+data: {"is_final": true, "billing": {"limit": "none", "can_proceed": true, …}}
 ```
 
-Field notes:
+The turn is a **tree of nodes** under `root_node_id`:
 
-- **`text`** is the **cumulative** plain-text reply (not a delta). The final
-  event carries the complete text.
-- **`html_content`** is the cumulative rendered HTML.
-- **`conversation_title`** appears on (usually the first) non-final event — the
-  LLM-generated title. Persist the latest seen value.
-- **`is_final: true`** marks the terminal payload: full `usage`, `timing`,
-  `context_usage`, `billing`, and `assistant_message_uuid`.
-- `cursor=0-0` requests from the start; the `id` values (`<ms>-<seq>`) are
-  resumable cursors for reconnects.
+| `payload.kind`      | Meaning                                                                 |
+| ------------------- | ----------------------------------------------------------------------- |
+| `assistant_message` | the root                                                                |
+| `text`              | answer text (markdown). Deltas via `node.delta`; full text on `node.completed` / `node.replaced` `payload.content` |
+| `activity`          | `type` = `thinking` (deltas too!), `tool_call` (`tool_name`, `arguments`; result in `node.completed.payload.result`) |
 
-#### One connection is not enough
+Event types (from the web client's reducer): `turn.started`, `turn.completed`,
+`turn.failed` (`payload.error_code`), `turn.cancelled`, `turn.awaiting_input`,
+`node.created`, `node.updated`, `node.delta`, `node.replaced`,
+`node.completed`, `node.failed`, `node.cancelled`, `reference.added`
+(citations: `ref_id`, `url`, `title`, `snippet`; the text cites them inline as
+`[^ref_id]`), `source.read`. Nested sub-turns (sub-agents) appear with their
+own `turn_id` and `parent_node_id`; the answer is the `text` nodes **directly
+under our root**.
 
-Because `text`/`html_content` are cumulative snapshots rather than deltas, a
-long turn re-sends the whole answer on every frame — quadratic traffic. A
-measured example: one deep-research turn had pushed **58 MB across 3,201
-frames** while still in its thinking phase, with individual frames reaching
-~100 KB. The edge in front of the API does not tolerate that; the connection is
-reset mid-turn (observed: HTTP/2 `INTERNAL_ERROR` at ~5 minutes).
+- **Deltas, not snapshots** — unlike the old stream, frames are small, but a
+  replayed event must not be applied twice.
+- **Replay renumbers ids.** Reading a *finished* turn (even with a `cursor`)
+  replays the whole log under **fresh SSE ids**, so the cursor is useless for
+  dedupe. Dedupe on `(turn_id, event.seq)` as the web client does.
+- The stream carries **no HTML**. Read it from the persisted row (below).
 
-The generation is **not** tied to the connection:
+### 3. Persisted turn — `GET /api/v2/branches/{branch_uuid}/turns?limit=N`
 
-- it keeps running after the reader disconnects,
-- `GET …/stream/status` reports `{"active": true}` for the whole time,
-- the finished answer is written to the conversation regardless (a turn whose
-  reader died at 5 min was persisted at 11 min and readable via
-  `/api/conversations/{uuid}/init`).
+`{turns: [...], has_more}`, oldest-first within the page. Each row: `uuid`,
+`role`, `content` (markdown), `html_content`, `status`
+(`running|completed|failed|cancelled|awaiting_input`), `error_code`, `model`,
+`model_version`, usage fields, `references`, `parent_message_uuid`, siblings.
+Optional `include=events`, `before=<uuid>`. This replaces
+`…/stream/status` as the "is it still running?" signal, and is the source of
+the final md/HTML. `GET /api/v2/turns/{uuid}` returns one row but with
+`html_content: null`.
 
-So a client must reconnect with `?cursor=<last event id>` instead of treating
-the drop as a failure — this is what the official web client does (it retries
-`/api/v2/turns/{uuid}/stream` with a cursor and dedups on `event.seq`). A
-cursor resumes *exclusive* of the given id and replays only the current turn.
-Snapshot semantics make a missed frame harmless: any later frame is a superset.
+### Abort
 
-### Follow-up turns
+- `POST /api/v2/turns/{uuid}/cancel`
+- `DELETE /api/v2/turns/{uuid}[?preserve_attachments=true]`
 
-Post to the same conversation's branch again with the next
-`POST /api/branches/{branch_uuid}/messages`; the branch's `head_message_uuid`
-threads the reply onto the prior turn. Resolve the head via
-`GET /api/conversations/{uuid}/init` → `active_branch.head_message_uuid`.
+### Reconnects
 
-### Abort / status
-
-- `POST /api/branches/{branch_uuid}/stream/cancel` — stop an in-flight stream.
-  Returns `{"status": "not_streaming", "count": 0}` when there was nothing to
-  cancel.
-- `GET  /api/branches/{branch_uuid}/stream/status` — poll stream state:
-  `{"active": bool, "branch_uuid": "…", "user_message_uuid": "…"}`. `active`
-  stays true while the turn is generating, whether or not anyone is reading the
-  stream — it is the signal for "reconnect" vs. "give up". Once the turn is over
-  the uuids come back `null`.
-- `GET …/stream` answers **`204 No Content`** once the turn's stream buffer is
-  gone. That is an empty read, not an error — treat it as "nothing more here"
-  and fall back to the persisted conversation.
+The generation outlives the connection and is persisted when it finishes
+(observed under the old stream: the edge reset long turns at ~5 min). The
+client reconnects with `?cursor=<last id>`, dedupes on `seq`, and when the wire
+goes quiet checks the persisted row: not `running` → take the persisted
+answer.
 
 ## Usage cap — `GET /api/billing/status`
 
@@ -532,11 +515,19 @@ POST   /api/conversations/import
 GET    /api/conversations/stats/counts
 POST   /api/conversations/deleted/purge
 
-POST   /api/branches/{branch}/messages
-GET    /api/branches/{branch}/stream         (SSE)
-POST   /api/branches/{branch}/stream/cancel
-GET    /api/branches/{branch}/stream/status
 POST   /api/branches/{branch}/share
+POST   /api/branches/{branch}/messages/{uuid}/report
+# removed 2026-10: POST /api/branches/{b}/messages (405), GET …/stream, …/stream/{status,cancel}
+
+POST   /api/v2/conversations                 (create + first turn)
+GET    /api/v2/conversations/{uuid}/init     GET /api/v2/conversations/{uuid}/branches
+POST   /api/v2/branches                      (fork)
+POST   /api/v2/branches/{branch}/respond     (follow-up / elicitation answer)
+GET    /api/v2/branches/{branch}/turns       GET /api/v2/branches/{branch}/context
+GET    /api/v2/branches/{branch}/artifacts/stream   GET …/artifacts/raw/{path}
+GET    /api/v2/turns/{uuid}                  DELETE /api/v2/turns/{uuid}
+GET    /api/v2/turns/{uuid}/stream           (SSE)
+POST   /api/v2/turns/{uuid}/cancel
 
 GET    /api/messages/{uuid}                  POST /api/messages/{uuid}/edit-response
 
@@ -601,4 +592,4 @@ automatically; redirects are disabled (`http.ErrUseLastResponse`) to read the
 `thread.json`, `tokens.json`, `new_message.json`, etc. Request envelope
 `{focus:{thread_id,branch_id,prompt,message_id}, profile:{id,model,
 internet_access,personalizations,lens_id}, threads:[…]}`. Superseded by the
-three-step v2 flow above. See git history of this file for the full v1 detail.
+v2 turns flow above. See git history of this file for the full v1 detail.

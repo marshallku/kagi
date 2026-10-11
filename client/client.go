@@ -320,182 +320,285 @@ func NewPrompt(prompt, threadID, parentMsgID, profileID, model string, internet 
 	}
 }
 
-// --- Chat flow (v2) ---------------------------------------------------------
+// --- Chat flow (v2 turns) ---------------------------------------------------
 
-// messageBody is the POST /api/branches/{branch}/messages payload.
-type messageBody struct {
-	Message         string  `json:"message"`
-	ThinkingPreset  *string `json:"thinking_preset"`
-	ModelName       string  `json:"model_name,omitempty"`
+// respondBody is the payload of both POST /api/v2/conversations (new
+// conversation + first turn in one call) and POST /api/v2/branches/{b}/respond
+// (follow-up turn on an existing branch).
+type respondBody struct {
+	Content         string  `json:"content"`
+	Model           string  `json:"model,omitempty"`
 	ProfileUUID     string  `json:"profile_uuid,omitempty"`
 	EnableSearch    *bool   `json:"enable_search,omitempty"`
 	Personalization *bool   `json:"personalization,omitempty"`
 	LensID          *string `json:"lens_id,omitempty"`
 }
 
-// startChat runs the first three steps of the v2 flow — resolve/create the
-// conversation + branch and post the user message — returning everything the
-// reader needs to pick the reply up. It does NOT read the stream; Send and
-// Stream do that differently.
+// dispatched is what both dispatch endpoints return: the turn that is now
+// running and where it runs.
+type dispatched struct {
+	ConversationUUID  string `json:"conversation_uuid"`
+	BranchUUID        string `json:"branch_uuid"`
+	AssistantTurnUUID string `json:"assistant_turn_uuid"`
+	UserTurnUUID      string `json:"user_turn_uuid"`
+}
+
+// startChat resolves the conversation/branch and dispatches the user turn,
+// returning everything the reader needs to pick the reply up. It does NOT
+// read the stream; Send and Stream do that differently.
 func (c *Client) startChat(ctx context.Context, req PromptRequest) (turn chatTurn, err error) {
 	model := req.Profile.Model
 	profileUUID := req.Profile.ID
-	branchUUID := ""
+	if model == "" && profileUUID == "" {
+		return turn, errors.New("chat: model or profile required")
+	}
+
+	body := respondBody{Content: req.Focus.Prompt, Model: model, ProfileUUID: profileUUID}
+	internet := req.Profile.InternetAccess
+	personalization := req.Profile.Personalizations
+	body.EnableSearch = &internet
+	body.Personalization = &personalization
+	body.LensID = req.Profile.LensID
 
 	convUUID := ""
 	if req.Focus.ThreadID != nil {
 		convUUID = *req.Focus.ThreadID
 	}
 
+	var d dispatched
 	if convUUID == "" {
-		// New conversation. POST /api/conversations needs a model_name; when a
-		// custom assistant is selected without an explicit model, fall back to
-		// the assistant's own base model.
-		createModel := model
-		if createModel == "" && profileUUID != "" {
-			ca, lerr := c.findAssistant(ctx, profileUUID)
-			if lerr != nil {
-				return turn, fmt.Errorf("resolve assistant model: %w", lerr)
-			}
-			createModel = ca.LLMID
+		if err = c.apiDo(ctx, http.MethodPost, "/api/v2/conversations", body, &d); err != nil {
+			return turn, dispatchError("create conversation", profileUUID, err)
 		}
-		if createModel == "" {
-			return turn, errors.New("chat: model or profile required")
-		}
-		var created struct {
-			Conversation  Conversation `json:"conversation"`
-			DefaultBranch Branch       `json:"default_branch"`
-		}
-		if err = c.apiDo(ctx, http.MethodPost, "/api/conversations",
-			map[string]string{"model_name": createModel}, &created); err != nil {
-			return turn, fmt.Errorf("create conversation: %w", err)
-		}
-		convUUID = created.Conversation.UUID
-		branchUUID = created.DefaultBranch.UUID
 	} else {
-		// Existing conversation: post onto its active branch.
+		// Existing conversation: respond on its active branch.
 		var init conversationInit
 		if err = c.apiDo(ctx, http.MethodGet, "/api/conversations/"+convUUID+"/init", nil, &init); err != nil {
 			return turn, fmt.Errorf("load conversation: %w", err)
 		}
-		branchUUID = init.ActiveBranch.UUID
+		branchUUID := init.ActiveBranch.UUID
 		if branchUUID == "" && len(init.Branches) > 0 {
 			branchUUID = init.Branches[0].UUID
 		}
 		if branchUUID == "" {
 			return turn, fmt.Errorf("conversation %s: no branch to post to", convUUID)
 		}
-	}
-
-	body := messageBody{Message: req.Focus.Prompt}
-	internet := req.Profile.InternetAccess
-	personalization := req.Profile.Personalizations
-	if profileUUID != "" {
-		body.ProfileUUID = profileUUID
-		if model != "" {
-			body.ModelName = model
+		if err = c.apiDo(ctx, http.MethodPost, "/api/v2/branches/"+branchUUID+"/respond", body, &d); err != nil {
+			return turn, dispatchError("post message", profileUUID, err)
 		}
-	} else {
-		body.ModelName = model
-	}
-	body.EnableSearch = &internet
-	body.Personalization = &personalization
-	body.LensID = req.Profile.LensID
-
-	var posted struct {
-		StreamURL string `json:"stream_url"`
-		Branch    struct {
-			UUID string `json:"uuid"`
-		} `json:"branch"`
-		UserMessage struct {
-			UUID string `json:"uuid"`
-		} `json:"user_message"`
-	}
-	if err = c.apiDo(ctx, http.MethodPost, "/api/branches/"+branchUUID+"/messages", body, &posted); err != nil {
-		if errors.Is(err, ErrNotFound) && profileUUID != "" {
-			return turn, fmt.Errorf("post message: profile %q not found — it may be a stale v1 profile id; pick one from `kagi profiles` or run `kagi config set profile <uuid>`", profileUUID)
+		// The server may answer on a different branch than the one we named;
+		// the reply and its persisted row live on the one it reports.
+		if d.BranchUUID == "" {
+			d.BranchUUID = branchUUID
 		}
-		return turn, fmt.Errorf("post message: %w", err)
+		if d.ConversationUUID == "" {
+			d.ConversationUUID = convUUID
+		}
 	}
-	// Posting can fork a branch, in which case the reply streams from the
-	// branch in the *response*, not the one we posted to. Resolve that first:
-	// both the fallback stream URL and status polling must name the same
-	// branch, or we would watch a turn nobody is waiting for.
-	if posted.Branch.UUID != "" {
-		branchUUID = posted.Branch.UUID
-	}
-	streamURL := posted.StreamURL
-	if streamURL == "" {
-		streamURL = "/api/branches/" + branchUUID + "/stream"
+	if d.AssistantTurnUUID == "" {
+		return turn, errors.New("chat: server did not return an assistant turn to stream")
 	}
 	return chatTurn{
-		branchUUID:  branchUUID,
-		convUUID:    convUUID,
-		streamURL:   streamURL,
-		userMsgUUID: posted.UserMessage.UUID,
+		convUUID:   d.ConversationUUID,
+		branchUUID: d.BranchUUID,
+		turnUUID:   d.AssistantTurnUUID,
+		streamURL:  "/api/v2/turns/" + url.PathEscape(d.AssistantTurnUUID) + "/stream",
 	}, nil
 }
 
-// chatTurn is what startChat resolved: where the reply will stream from, and
-// the user message it answers.
+func dispatchError(step, profileUUID string, err error) error {
+	if errors.Is(err, ErrNotFound) && profileUUID != "" {
+		return fmt.Errorf("%s: profile %q not found — it may be a stale v1 profile id; pick one from `kagi profiles` or run `kagi config set profile <uuid>`", step, profileUUID)
+	}
+	return fmt.Errorf("%s: %w", step, err)
+}
+
+// chatTurn is what startChat resolved: the assistant turn being generated and
+// where it lives.
 type chatTurn struct {
-	branchUUID  string
-	convUUID    string
-	streamURL   string
-	userMsgUUID string
+	convUUID   string
+	branchUUID string
+	turnUUID   string // assistant turn uuid; also the persisted message uuid
+	streamURL  string
 }
 
-// sseEvent is the JSON payload of each `data:` line in the response stream.
-type sseEvent struct {
-	Text               string `json:"text"`
-	HTMLContent        string `json:"html_content"`
-	ConversationUUID   string `json:"conversation_uuid"`
-	BranchUUID         string `json:"branch_uuid"`
-	ConversationTitle  string `json:"conversation_title"`
-	ModelName          string `json:"model_name"`
-	IsFinal            bool   `json:"is_final"`
-	AssistantMessageID string `json:"assistant_message_uuid"`
-	Error              string `json:"error"`
+// sseFrame is the JSON payload of one `data:` line on the turn stream. Most
+// frames wrap a turn event; a few are bare (`title`, the closing `is_final`).
+type sseFrame struct {
+	Event   *turnEvent `json:"event"`
+	Title   string     `json:"title"`
+	IsFinal bool       `json:"is_final"`
+	Error   string     `json:"error"`
 }
 
-// Stream constants. A single SSE connection to the assistant API does not
-// survive a long turn: every frame re-sends the whole cumulative reply, so a
-// deep-research answer pushes hundreds of megabytes through the connection and
-// the edge proxy resets it (observed: HTTP/2 INTERNAL_ERROR at ~5 minutes).
-// The generation itself keeps running server-side and is persisted when it
-// finishes, so the fix is to reconnect from the last event id rather than to
-// give up — which is what the official web client does too.
+// turnEvent is one event of the event-sourced turn log. Text arrives as
+// `node.delta` appends; `node.completed`/`node.replaced` carry the full text.
+type turnEvent struct {
+	Seq          int          `json:"seq"`
+	TurnID       string       `json:"turn_id"`
+	Type         string       `json:"type"`
+	NodeID       string       `json:"node_id"`
+	ParentNodeID string       `json:"parent_node_id"`
+	Payload      eventPayload `json:"payload"`
+}
+
+type eventPayload struct {
+	RootNodeID string          `json:"root_node_id"`
+	Kind       string          `json:"kind"`
+	Delta      string          `json:"delta"`
+	Content    json.RawMessage `json:"content"` // a string on text nodes; other shapes elsewhere
+	ErrorCode  string          `json:"error_code"`
+}
+
+// contentString returns payload.content when it is a string.
+func (p eventPayload) contentString() (string, bool) {
+	if len(p.Content) == 0 || p.Content[0] != '"' {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(p.Content, &s) != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// Stream constants. A single SSE connection does not survive every long turn
+// (observed: the edge proxy resetting it at ~5 minutes), while the generation
+// keeps running server-side and is persisted when it finishes. So a dropped
+// connection is reconnected rather than given up on — which is what the
+// official web client does too.
 const (
 	// streamMaxStalls bounds *consecutive* reconnects that yield no new
-	// frames. A healthy long turn always makes progress, so this only trips
+	// events. A healthy long turn always makes progress, so this only trips
 	// when the stream is genuinely over or wedged.
 	streamMaxStalls = 5
 	// streamRetryDelay is the pause before each reconnect attempt.
 	streamRetryDelay = 2 * time.Second
 	// streamRecoverTries is how many times the persisted-answer fallback
-	// re-reads the conversation before giving up.
+	// re-reads the turn before giving up.
 	streamRecoverTries = 3
 )
 
-// sseState is the cursor and cumulative reply carried across reconnects. The
-// v2 frames are snapshots rather than deltas, so resuming only needs the last
-// event id; the cumulative fields exist because the terminal frame carries
-// only `text` and we still owe the caller an `html_content`.
+// turnNode is one node of the turn's tree. Only kind "text" nodes carry the
+// answer; the rest (thinking, tool calls) are tracked so their deltas are not
+// mistaken for answer text.
+type turnNode struct {
+	kind   string
+	parent string
+	text   string
+}
+
+// sseState is the turn reconstruction carried across reconnects. Events are
+// deltas, so a replayed event must not be applied twice: the server replays a
+// finished turn under fresh SSE ids, which makes the cursor useless for
+// dedupe, so applied events are tracked by their per-turn seq instead.
 type sseState struct {
-	cursor    string // last event id seen; "0-0" means "from the start"
-	final     bool   // a terminal new_message.json was emitted
-	sawDone   bool   // the [DONE] sentinel was seen — nothing more will arrive
-	frames    int    // total frames flushed, used to detect progress
+	cursor    string         // last SSE id seen; "0-0" means "from the start"
+	ended     bool           // the turn is over on the wire (is_final or a terminal turn event)
+	final     bool           // the terminal new_message.json was emitted
+	events    int            // events applied, used to detect progress
+	seen      map[string]int // highest applied seq per turn id
+	rootNode  string         // root node of our turn; its text children form the reply
+	nodes     map[string]*turnNode
+	order     []string // node ids in creation order
 	titleSent string
-	lastText  string
-	lastHTML  string
+	lastText  string // reply text last emitted as tokens
+}
+
+func newSSEState() *sseState {
+	return &sseState{cursor: "0-0", seen: map[string]int{}, nodes: map[string]*turnNode{}}
+}
+
+// replyText joins the text nodes directly under the turn's root, in order.
+// Nested nodes belong to sub-agents and are not part of the answer.
+func (st *sseState) replyText() string {
+	var parts []string
+	for _, id := range st.order {
+		n := st.nodes[id]
+		if n.kind == "text" && n.parent == st.rootNode && n.text != "" {
+			parts = append(parts, n.text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// apply folds one turn event into the state. It reports whether the event was
+// new and, for a failed or cancelled turn, the upstream error.
+func (st *sseState) apply(ev *turnEvent, turnUUID string) (bool, error) {
+	if ev.Seq > 0 {
+		if ev.Seq <= st.seen[ev.TurnID] {
+			return false, nil
+		}
+		st.seen[ev.TurnID] = ev.Seq
+	}
+	st.events++
+	ours := ev.TurnID == "" || ev.TurnID == turnUUID
+	p := ev.Payload
+	switch ev.Type {
+	case "turn.started":
+		if ours && p.RootNodeID != "" {
+			st.rootNode = p.RootNodeID
+		}
+	case "turn.completed", "turn.awaiting_input":
+		if ours {
+			st.ended = true
+		}
+	case "turn.failed":
+		if ours {
+			return true, &upstreamError{msg: "turn failed" + codeSuffix(p.ErrorCode)}
+		}
+	case "turn.cancelled":
+		if ours {
+			return true, &upstreamError{msg: "turn was cancelled"}
+		}
+	case "node.created":
+		n := st.node(ev, p.Kind)
+		if p.Kind != "" {
+			n.kind = p.Kind
+		}
+		if s, ok := p.contentString(); ok {
+			n.text = s
+		}
+	case "node.delta":
+		// A delta for a node never announced is text, as in the web
+		// client's reducer.
+		st.node(ev, "text").text += p.Delta
+	case "node.completed", "node.replaced":
+		n := st.node(ev, "text")
+		if s, ok := p.contentString(); ok {
+			n.text = s
+		}
+	case "node.failed":
+		if ours && ev.NodeID != "" && ev.NodeID == st.rootNode {
+			return true, &upstreamError{msg: "reply failed" + codeSuffix(p.ErrorCode)}
+		}
+	}
+	return true, nil
+}
+
+// node returns the node for ev, creating it with kind on first sight.
+func (st *sseState) node(ev *turnEvent, kind string) *turnNode {
+	if n, ok := st.nodes[ev.NodeID]; ok {
+		return n
+	}
+	n := &turnNode{kind: kind, parent: ev.ParentNodeID}
+	st.nodes[ev.NodeID] = n
+	st.order = append(st.order, ev.NodeID)
+	return n
+}
+
+func codeSuffix(code string) string {
+	if code == "" {
+		return ""
+	}
+	return " (" + code + ")"
 }
 
 // Stream runs a chat turn and emits events. For compatibility with the v1
 // consumers (client.Send, the HTTP server's snoop+relay), the events are
 // emitted under the v1 type names — `thread.json`, `tokens.json`, and a
 // terminal `new_message.json` carrying state="done" — synthesised from the v2
-// SSE stream.
+// turn stream.
 func (c *Client) Stream(ctx context.Context, req PromptRequest) (<-chan Event, <-chan error, error) {
 	turn, err := c.startChat(ctx, req)
 	if err != nil {
@@ -524,14 +627,19 @@ func (c *Client) Stream(ctx context.Context, req PromptRequest) (<-chan Event, <
 	return events, errs, nil
 }
 
-// openStream opens one SSE connection to the branch stream at the given
-// cursor. The caller owns the returned body.
+// openStream opens one SSE connection to the turn stream at the given cursor.
+// The caller owns the returned body.
 func (c *Client) openStream(ctx context.Context, streamURL, cursor string) (*http.Response, error) {
-	sep := "?"
-	if strings.Contains(streamURL, "?") {
-		sep = "&"
+	u := c.base() + streamURL
+	// The web client omits the cursor when reading from the start.
+	if cursor != "" && cursor != "0-0" {
+		sep := "?"
+		if strings.Contains(streamURL, "?") {
+			sep = "&"
+		}
+		u += sep + "cursor=" + url.QueryEscape(cursor)
 	}
-	req, err := c.newRequestURL(ctx, http.MethodGet, c.base()+streamURL+sep+"cursor="+url.QueryEscape(cursor), nil)
+	req, err := c.newRequestURL(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -559,26 +667,26 @@ func (c *Client) openStream(ctx context.Context, streamURL, cursor string) (*htt
 	return resp, nil
 }
 
-// pumpStream drains the SSE stream to completion, reconnecting from the last
-// event id whenever the connection drops before the terminal frame. It takes
+// pumpStream drains the turn stream to completion, reconnecting from the last
+// event id whenever the connection drops before the turn ends. It takes
 // ownership of resp.
 func (c *Client) pumpStream(ctx context.Context, resp *http.Response, turn chatTurn, out chan<- Event) error {
-	st := &sseState{cursor: "0-0"}
+	st := newSSEState()
 	stalls, reconnects := 0, 0
 	var lastErr error
 
 	for {
 		if resp != nil {
-			before := st.frames
-			lastErr = relaySSE(ctx, resp.Body, turn.convUUID, out, st)
+			before := st.events
+			lastErr = relaySSE(ctx, resp.Body, turn, out, st)
 			resp.Body.Close()
 			resp = nil
 
-			if st.final {
-				return nil
+			if st.ended {
+				return c.finishTurn(ctx, turn, out, st)
 			}
-			// A frame carrying an explicit error is upstream's verdict on the
-			// turn, not a transport hiccup — reconnecting would just replay it.
+			// An event saying the turn failed is upstream's verdict, not a
+			// transport hiccup — reconnecting would just replay it.
 			var ue *upstreamError
 			if errors.As(lastErr, &ue) {
 				return lastErr
@@ -586,26 +694,19 @@ func (c *Client) pumpStream(ctx context.Context, resp *http.Response, turn chatT
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-
-			if st.frames > before {
+			if st.events > before {
 				stalls = 0
 			} else {
 				stalls++
-			}
-			// The sentinel means the stream is closed for good. Reconnecting
-			// would only re-read it, so go straight to what was persisted —
-			// we get here when the terminal frame itself was lost.
-			if st.sawDone {
-				return c.recoverPersisted(ctx, turn, out, st, lastErr)
 			}
 		}
 
 		// Two fruitless attempts in a row with the turn no longer running:
 		// nothing more will arrive on the wire. One is not enough — generation
 		// can go quiet between chunks and finish right after the status check,
-		// leaving the terminal frame still unread.
+		// leaving the terminal events still unread.
 		if stalls >= 2 {
-			if active, serr := c.streamActive(ctx, turn.branchUUID); serr == nil && !active {
+			if t, ok, serr := c.persistedTurn(ctx, turn); serr == nil && ok && t.Status != "running" {
 				return c.recoverPersisted(ctx, turn, out, st, lastErr)
 			}
 		}
@@ -639,39 +740,86 @@ func (c *Client) pumpStream(ctx context.Context, resp *http.Response, turn chatT
 	}
 }
 
-// streamStatus is GET /api/branches/{uuid}/stream/status — whether a turn is
-// still being generated on that branch.
-type streamStatus struct {
-	Active bool `json:"active"`
+// persistedTurnRow is one row of GET /api/v2/branches/{b}/turns. Unlike the
+// stream, it carries the server-rendered html_content.
+type persistedTurnRow struct {
+	UUID        string `json:"uuid"`
+	Role        string `json:"role"`
+	Content     string `json:"content"`
+	HTMLContent string `json:"html_content"`
+	Status      string `json:"status"` // running | completed | failed | cancelled | awaiting_input
+	ErrorCode   string `json:"error_code"`
 }
 
-func (c *Client) streamActive(ctx context.Context, branchUUID string) (bool, error) {
-	var st streamStatus
-	if err := c.apiDo(ctx, http.MethodGet, "/api/branches/"+branchUUID+"/stream/status", nil, &st); err != nil {
-		return false, err
+// persistedTurn reads our assistant turn back from its branch. ok is false
+// when the turn is not (yet) among the branch's latest turns.
+func (c *Client) persistedTurn(ctx context.Context, turn chatTurn) (persistedTurnRow, bool, error) {
+	var page struct {
+		Turns []persistedTurnRow `json:"turns"`
 	}
-	return st.Active, nil
+	if err := c.apiDo(ctx, http.MethodGet, "/api/v2/branches/"+turn.branchUUID+"/turns?limit=4", nil, &page); err != nil {
+		return persistedTurnRow{}, false, err
+	}
+	for _, t := range page.Turns {
+		if t.UUID == turn.turnUUID {
+			return t, true, nil
+		}
+	}
+	return persistedTurnRow{}, false, nil
 }
 
-// recoverPersisted is the last resort when the stream stopped without a
-// terminal frame. The generation outlives the connection and is written to the
-// conversation when it finishes, so a completed answer is often already
-// readable even though we never saw `is_final`.
+// finishTurn emits the terminal event once the stream reported the turn over.
+// The persisted row is preferred — it is the canonical markdown and the only
+// source of HTML — but the answer already streamed is not thrown away when
+// that read fails.
+func (c *Client) finishTurn(ctx context.Context, turn chatTurn, out chan<- Event, st *sseState) error {
+	md, html := st.replyText(), ""
+	// The row can trail the stream's end by a beat, as in recoverPersisted.
+	for attempt := 0; ; attempt++ {
+		t, ok, err := c.persistedTurn(ctx, turn)
+		if err == nil && ok && t.Status != "running" {
+			if t.Status == "failed" || t.Status == "cancelled" {
+				return &upstreamError{msg: "turn " + t.Status + codeSuffix(t.ErrorCode)}
+			}
+			if t.Content != "" {
+				md = t.Content
+			}
+			html = t.HTMLContent
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt >= streamRecoverTries-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(streamRetryDelay):
+		}
+	}
+	return emitDone(ctx, turn, out, st, md, html)
+}
+
+// recoverPersisted is the last resort when the stream stopped without the
+// turn ending on the wire. The generation outlives the connection and is
+// written to the branch when it finishes, so a completed answer is often
+// already readable even though we never saw it end.
 func (c *Client) recoverPersisted(ctx context.Context, turn chatTurn, out chan<- Event, st *sseState, cause error) error {
-	if turn.convUUID == "" || turn.userMsgUUID == "" {
-		return c.giveUp(ctx, turn.convUUID, cause)
-	}
 	// The write can trail the stream going idle by a beat, so give it a few
 	// tries before declaring the answer lost.
-	var m Message
 	for attempt := 0; ; attempt++ {
-		var init conversationInit
-		if err := c.apiDo(ctx, http.MethodGet, "/api/conversations/"+turn.convUUID+"/init", nil, &init); err == nil {
-			// Only accept a reply to *this* turn — the previous turn's answer
-			// is still sitting in the same conversation.
-			if got, ok := replyTo(init.Messages.Items, turn.userMsgUUID); ok {
-				m = got
-				break
+		t, ok, err := c.persistedTurn(ctx, turn)
+		if err == nil && ok {
+			switch t.Status {
+			case "failed", "cancelled":
+				return &upstreamError{msg: "turn " + t.Status + codeSuffix(t.ErrorCode)}
+			case "running":
+			default:
+				if t.Content != "" {
+					return emitDone(ctx, turn, out, st, t.Content, t.HTMLContent)
+				}
 			}
 		}
 		if ctx.Err() != nil {
@@ -686,38 +834,32 @@ func (c *Client) recoverPersisted(ctx context.Context, turn chatTurn, out chan<-
 		case <-time.After(streamRetryDelay):
 		}
 	}
-	// Emit the recovered text as a token frame first: `kagi chat --stream`
-	// prints only tokens, so without this the terminal event would carry an
-	// answer the user never sees.
-	if m.Content != st.lastText {
-		tok, _ := json.Marshal(map[string]string{"text": m.Content, "id": m.UUID})
+}
+
+// emitDone sends the terminal new_message.json. When the final text differs
+// from what was streamed it is sent as a token frame first: `kagi chat
+// --stream` prints only tokens, so without this the terminal event would carry
+// an answer the user never sees.
+func emitDone(ctx context.Context, turn chatTurn, out chan<- Event, st *sseState, md, html string) error {
+	if md != st.lastText {
+		tok, _ := json.Marshal(map[string]string{"text": md, "id": turn.turnUUID})
 		if err := sendEvent(ctx, out, Event{Type: "tokens.json", Data: tok}); err != nil {
 			return err
 		}
-		st.lastText = m.Content
+		st.lastText = md
 	}
 	done, _ := json.Marshal(map[string]any{
-		"id":        m.UUID,
+		"id":        turn.turnUUID,
 		"thread_id": turn.convUUID,
 		"state":     "done",
-		"reply":     m.HTMLContent,
-		"md":        m.Content,
+		"reply":     html,
+		"md":        md,
 	})
 	if err := sendEvent(ctx, out, Event{Type: "new_message.json", Data: done}); err != nil {
 		return err
 	}
 	st.final = true
 	return nil
-}
-
-// replyTo finds the assistant message answering userMsgUUID.
-func replyTo(items []Message, userMsgUUID string) (Message, bool) {
-	for _, m := range items {
-		if m.Role == "assistant" && m.ParentMessageUUID == userMsgUUID && m.Content != "" {
-			return m, true
-		}
-	}
-	return Message{}, false
 }
 
 // billingStatus is GET /api/billing/status.
@@ -777,18 +919,19 @@ func sendEvent(ctx context.Context, out chan<- Event, ev Event) error {
 	}
 }
 
-// upstreamError marks an error the server reported inside a frame, as opposed
+// upstreamError marks an error the server reported for the turn, as opposed
 // to a transport failure. Only the latter is worth reconnecting for.
 type upstreamError struct{ msg string }
 
 func (e *upstreamError) Error() string { return e.msg }
 
-// relaySSE reads the v2 Server-Sent Events stream and translates each into the
-// v1-style events the existing consumers expect. `text` is cumulative, so we
-// forward it as the `tokens.json.text` field on every update. State that has
-// to survive a reconnect (cursor, cumulative text, whether the title was
-// already emitted) lives in st.
-func relaySSE(ctx context.Context, r io.Reader, convUUID string, out chan<- Event, st *sseState) error {
+// relaySSE reads the v2 turn stream, folds each event into st and translates
+// the result into the v1-style events the existing consumers expect: the reply
+// is rebuilt from text-node deltas and forwarded cumulatively as
+// `tokens.json.text` whenever it changes. It returns io.EOF once the turn has
+// ended (st.ended) or the connection closed; the terminal event is emitted by
+// the caller, which can read the persisted HTML.
+func relaySSE(ctx context.Context, r io.Reader, turn chatTurn, out chan<- Event, st *sseState) error {
 	br := bufio.NewReader(r)
 	var dataBuf bytes.Buffer
 	pendingID := ""
@@ -802,11 +945,11 @@ func relaySSE(ctx context.Context, r io.Reader, convUUID string, out chan<- Even
 		eventID := pendingID
 		pendingID = ""
 		if strings.TrimSpace(payload) == "[DONE]" {
-			st.sawDone = true
+			st.ended = true
 			return io.EOF
 		}
-		var ev sseEvent
-		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+		var fr sseFrame
+		if err := json.Unmarshal([]byte(payload), &fr); err != nil {
 			return nil // ignore non-JSON keepalive frames
 		}
 		// Only advance the cursor once the frame has been understood, so a
@@ -814,49 +957,37 @@ func relaySSE(ctx context.Context, r io.Reader, convUUID string, out chan<- Even
 		if eventID != "" {
 			st.cursor = eventID
 		}
-		st.frames++
-		if ev.Error != "" {
-			return &upstreamError{msg: ev.Error}
+		if fr.Error != "" {
+			return &upstreamError{msg: fr.Error}
 		}
-		cid := ev.ConversationUUID
-		if cid == "" {
-			cid = convUUID
-		}
-		// Title (emitted once, usually on the first frame).
-		if ev.ConversationTitle != "" && ev.ConversationTitle != st.titleSent {
-			st.titleSent = ev.ConversationTitle
-			b, _ := json.Marshal(map[string]string{"id": cid, "title": ev.ConversationTitle})
+		if fr.Title != "" && fr.Title != st.titleSent {
+			st.titleSent = fr.Title
+			b, _ := json.Marshal(map[string]string{"id": turn.convUUID, "title": fr.Title})
 			if err := sendEvent(ctx, out, Event{Type: "thread.json", Data: b}); err != nil {
 				return err
 			}
 		}
-		if ev.Text != "" {
-			st.lastText = ev.Text
-		}
-		if ev.HTMLContent != "" {
-			st.lastHTML = ev.HTMLContent
-		}
-		// Incremental tokens (text is cumulative).
-		tok, _ := json.Marshal(map[string]string{"text": ev.Text, "id": ev.AssistantMessageID})
-		if err := sendEvent(ctx, out, Event{Type: "tokens.json", Data: tok}); err != nil {
-			return err
-		}
-		// Terminal frame: the final SSE frame usually carries only `text`, so
-		// fall back to the last seen cumulative values for both fields.
-		if ev.IsFinal && !st.final {
-			done, _ := json.Marshal(map[string]any{
-				"id":        ev.AssistantMessageID,
-				"thread_id": cid,
-				"state":     "done",
-				"reply":     st.lastHTML,
-				"md":        st.lastText,
-			})
-			if err := sendEvent(ctx, out, Event{Type: "new_message.json", Data: done}); err != nil {
-				return err
+		if fr.Event != nil {
+			fresh, uerr := st.apply(fr.Event, turn.turnUUID)
+			if uerr != nil {
+				return uerr
 			}
-			st.final = true
-			// The turn is answered. Stop reading rather than wait out a
-			// connection the server may hold open past the terminal frame.
+			if fresh {
+				if text := st.replyText(); text != st.lastText {
+					st.lastText = text
+					tok, _ := json.Marshal(map[string]string{"text": text, "id": turn.turnUUID})
+					if err := sendEvent(ctx, out, Event{Type: "tokens.json", Data: tok}); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if fr.IsFinal {
+			st.ended = true
+		}
+		// The turn is over. Stop reading rather than wait out a connection
+		// the server may hold open past the end.
+		if st.ended {
 			return io.EOF
 		}
 		return nil
